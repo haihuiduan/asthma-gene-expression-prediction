@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-This repository is a portfolio-focused reconstruction of a previous DATA3888 biomedical machine learning group project. The current version is a proof-of-concept biomedical machine learning pipeline for asthma vs control classification using public GEO gene expression datasets.
+This repository presents a portfolio-focused biomedical machine learning pipeline for asthma vs control classification using public GEO gene expression datasets.
+
+The project was reconstructed and expanded from a previous university biomedical data science project, with the current version focusing on reproducible preprocessing, multi-dataset integration, batch correction, PCA inspection, baseline modeling, and evaluation.
 
 The completed portfolio workflow includes both a single-dataset MVP using `GSE40732` and a multi-dataset pipeline using `GSE40732`, `GSE40888`, and `GSE64913`. The focus is reproducible data preprocessing, gene-symbol alignment, multi-dataset integration, ComBat batch correction, PCA inspection, baseline modeling, evaluation, and limitations.
 
