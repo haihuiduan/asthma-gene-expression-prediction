@@ -37,7 +37,7 @@ After probe-to-gene mapping and duplicate gene-symbol collapsing, the final merg
 - 369 samples
 - 15,622 common genes shared across all three datasets
 
-The original DATA3888 report and source materials are kept under `reports/` for reference. The original Shiny app from the group project is not included because this reconstruction focuses on the reproducible data and machine learning pipeline.
+The original group project also included a Shiny demonstration interface, but this portfolio reconstruction focuses on the reproducible data preprocessing and machine learning pipeline.
 
 ## Completed Workflow
 
@@ -80,7 +80,7 @@ PCA showed strong dataset-level structure before ComBat correction:
 - Before ComBat: PC1 variance 0.8129, PC2 variance 0.0997
 - After ComBat: PC1 variance 0.2267, PC2 variance 0.0582
 
-These plots are used as an exploratory check of dataset-level batch effects and the effect of correction.
+The sharp reduction in PC1 explained variance after ComBat suggests that the dominant dataset-level batch effect was substantially reduced. However, residual heterogeneity may remain because the datasets differ in cohort design, experimental platform, and biological sample type.
 
 ![PCA before ComBat by batch](figures/pca_before_combat_by_batch.png)
 
@@ -106,12 +106,14 @@ Random Forest achieved the highest ROC-AUC in the current multi-dataset baseline
 
 ## Key Outputs
 
-Processed data:
+Generated processed data files, such as the merged expression matrices and labels, are written to `data/processed/` when the pipeline is run locally. These files are not tracked in Git because they are generated data outputs.
 
-- `data/processed/merged_expression_common_genes.csv`
-- `data/processed/merged_expression_combat_corrected.csv`
-- `data/processed/merged_labels.csv`
-- `data/processed/merged_batch_labels.csv`
+Tracked result summaries include:
+
+- `results/common_genes_summary.csv`
+- `results/pca_combat_summary.csv`
+- `results/multi_dataset_model_metrics.csv`
+- `results/multi_dataset_selected_features.csv`
 
 Results:
 
@@ -147,7 +149,6 @@ asthma-gene-expression-prediction/
 |   `-- evaluation.py
 |-- figures/
 |-- results/
-|-- reports/
 |-- README.md
 |-- requirements.txt
 `-- .gitignore
