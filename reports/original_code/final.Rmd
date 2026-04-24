@@ -1,0 +1,3371 @@
+---
+title: "DATA3888 Interdisciplinary"
+format: revealjs
+editor: visual
+---
+
+## Loading 40732 Dataset and finding differentially expressed genes
+
+```{r}
+library(GEOquery)
+```
+
+```{r}
+gse <- getGEO(filename = "data/GSE40732_series_matrix.txt.gz")
+gse@annotation
+```
+
+```{r}
+expr_matrix <- exprs(gse)
+dim(expr_matrix)
+head(expr_matrix[, 1:5])
+
+pheno_data_40732 <- pData(gse)
+head(pheno_data_40732, 80)
+
+feature_data_40732 <- fData(gse)
+head(feature_data_40732)
+```
+
+```{r}
+# Step 1: Filter rows where rownames begin with "NM_"
+nm_rows <- grep("^NM_", rownames(expr_matrix), value = TRUE)
+expr_matrix_nm <- expr_matrix[nm_rows, ]
+
+# Step 2: Trim last 6 characters from each rowname (accession suffix)
+refseq_ids <- rownames(expr_matrix_nm)
+```
+
+```{r}
+# Step 3: Load org.Hs.eg.db to map NM_ accessions to gene symbols
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  install.packages("BiocManager")
+  BiocManager::install("org.Hs.eg.db")
+}
+```
+
+```{r}
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+```
+
+```{r}
+gene_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(refseq_ids),
+  columns = c("REFSEQ", "SYMBOL"),
+  keytype = "REFSEQ"
+)
+
+# Step 5: Convert expression matrix to data frame and join with gene symbols
+expr_df <- as.data.frame(expr_matrix_nm)
+expr_df$RefSeq <- rownames(expr_df)
+
+# Merge the expression matrix with gene symbol annotations
+expr_annotated <- merge(expr_df, gene_map, by.x = "RefSeq", by.y = "REFSEQ", all.x = TRUE)
+
+# Optional: Move SYMBOL column to the front
+expr_annotated <- expr_annotated[, c("SYMBOL", setdiff(names(expr_annotated), "SYMBOL"))]
+
+# View result
+head(expr_annotated)
+
+```
+
+```{r}
+library(dplyr)
+
+# Step 1: Remove rows with NA gene symbols
+expr_annotated_clean <- expr_annotated[!is.na(expr_annotated$SYMBOL), ]
+
+# Step 2: Group by SYMBOL and calculate row-wise mean for each gene
+# We'll exclude the "RefSeq" column and average across all sample columns
+expr_aggregated <- expr_annotated_clean %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE))
+
+expr_matrix_40732 <- as.data.frame(expr_aggregated)
+rownames(expr_matrix_40732) <- expr_matrix_40732$SYMBOL
+expr_matrix_40732$SYMBOL <- NULL
+
+head(expr_matrix_40732)
+```
+
+```{r}
+library(limma)
+
+# Create group labels (Asthma vs Control)
+group_40732 <- factor(ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control"))
+
+# Create design matrix
+design_40732 <- model.matrix(~0 + group_40732)
+colnames(design_40732) <- levels(group_40732)
+
+# Fit linear model
+fit_40732 <- lmFit(expr_matrix_40732, design_40732)
+
+# Create contrast: Asthma vs Control
+contrast_40732 <- makeContrasts(Asthma - Control, levels = design_40732)
+fit2_40732 <- contrasts.fit(fit_40732, contrast_40732)
+fit2_40732 <- eBayes(fit2_40732)
+
+# Get all DE results
+de_results_40732 <- topTable(fit2_40732, number = Inf, sort.by = "P")
+
+# Quick check
+head(de_results_40732)
+
+top100_40732 <- rownames(de_results_40732)[order(de_results_40732$P.Value)][1:100]
+```
+
+## Loading 67472 dataset and running random forest to confirm it can be merged
+
+```{r}
+library(GEOquery)
+library(affy)
+
+# (2) Extract the CEL files if you haven't already
+untar("GSE67472_RAW.tar", exdir = "GSE67472/")
+
+# (3) Read CEL files
+cel_files <- list.celfiles("GSE67472/", full.names = TRUE)
+
+# (4) Load raw data
+raw_data <- ReadAffy(filenames = cel_files)
+
+# (5) Normalize using RMA
+norm_data <- rma(raw_data)
+
+# (6) Extract expression matrix
+expr_matrix_new <- exprs(norm_data)
+
+# (7) Check result
+dim(expr_matrix_new)
+head(expr_matrix_new[, 1:5])
+
+```
+
+```{r}
+library(hgu133plus2.db)
+
+# Map probe IDs to Gene Symbols
+gene_symbols <- mapIds(hgu133plus2.db,
+                       keys = rownames(expr_matrix_new),
+                       column = "SYMBOL",
+                       keytype = "PROBEID",
+                       multiVals = "first")
+
+# Check mapping
+cat("Number of probes with mapped gene symbols:", sum(!is.na(gene_symbols)), "\n")
+head(gene_symbols, 20)
+```
+
+```{r}
+# Step 1: Keep only rows that map to a gene symbol
+expr_matrix_filtered <- expr_matrix_new[!is.na(gene_symbols), ]
+
+# Step 2: Replace rownames with gene symbols
+rownames(expr_matrix_filtered) <- gene_symbols[rownames(expr_matrix_filtered)]
+
+# Step 3: Convert to data frame for aggregation
+expr_df <- as.data.frame(expr_matrix_filtered)
+
+# Step 4: Collapse rows with the same gene symbol by averaging across columns (samples)
+expr_collapsed <- expr_df %>%
+  group_by(GeneSymbol = rownames(expr_df)) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+# Step 5: Convert back to matrix-style format with SYMBOLs as rownames
+expr_matrix_67472 <- as.data.frame(expr_collapsed)
+rownames(expr_matrix_67472) <- expr_matrix_67472$GeneSymbol
+expr_matrix_67472$GeneSymbol <- NULL
+
+# --- PCA-based split for raw GSE67472 (before any ComBat) ---
+pca_67472 <- prcomp(t(expr_matrix_67472), center = TRUE, scale. = TRUE)
+split_labels_67472 <- ifelse(pca_67472$x[, 1] > 0, "batch1", "batch2")
+
+samples_67472_batch1 <- rownames(pca_67472$x)[split_labels_67472 == "batch1"]
+samples_67472_batch2 <- rownames(pca_67472$x)[split_labels_67472 == "batch2"]
+
+raw_67472_batch1 <- expr_matrix_67472[, samples_67472_batch1]
+raw_67472_batch2 <- expr_matrix_67472[, samples_67472_batch2]
+
+
+colnames(expr_matrix_67472) <- sub("_.*", "", colnames(expr_matrix_67472))
+
+# Optional: preview result
+head(expr_matrix_67472)
+length(rownames(expr_matrix_67472))
+
+
+```
+
+```{r}
+gse_67472 <- getGEO(filename = "data/GSE67472_series_matrix.txt.gz")
+
+# Extract phenotype data
+pheno_data_67472 <- pData(gse_67472)
+
+# Quick check
+head(pheno_data_67472)
+
+pheno_data_67472 <- pheno_data_67472[colnames(expr_matrix_67472), ]
+
+# Check
+head(pheno_data_67472)
+```
+
+```{r}
+symbols_67472 <- rownames(expr_matrix_67472)
+symbols_40732 <- rownames(expr_matrix_40732)
+```
+
+```{r}
+# out of the 16947 cells that could be connected to a gene symbol in GSE67472, 163 could be matched to a gene symbol in GSE40732
+shared_genes_40732 <- intersect(symbols_67472, symbols_40732)
+length(intersect(symbols_67472, symbols_40732))
+```
+
+Now, building random forest model:
+
+```{r}
+library(randomForest)
+library(caret) 
+
+# Combine two phenotype tables (make sure rows = samples in combined expression matrix)
+pheno_data_new <- rbind(
+  data.frame(Sample = colnames(expr_matrix_67472), 
+             Label = ifelse(pheno_data_67472$`disease state:ch1` == "asthma", "Asthma", "Control"),
+             Dataset = "GSE67472"),
+  data.frame(Sample = colnames(expr_matrix_40732), 
+             Label = ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control"),
+             Dataset = "GSE40732")
+)
+
+```
+
+```{r}
+train_y <- factor(ifelse(grepl("asthma", pheno_data_67472$characteristics_ch1.3, ignore.case = TRUE), 
+                         "Asthma", "Control"))
+
+test_y <- factor(ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control"))
+```
+
+```{r}
+train_X <- as.data.frame(t(expr_matrix_67472))
+test_X  <- as.data.frame(t(expr_matrix_40732))
+
+# 3. Match sample order to phenotype data (assuming sample names are rownames)
+rownames(train_X) <- rownames(pheno_data_67472)
+rownames(test_X)  <- rownames(pheno_data_40732)
+
+train_X <- train_X[rownames(pheno_data_67472), ]
+test_X  <- test_X[rownames(pheno_data_40732), ]
+```
+
+```{r}
+# Step 1: Get common genes
+common_genes <- intersect(colnames(train_X), colnames(test_X))
+
+# Step 2: Subset and reorder both datasets
+train_X_aligned <- train_X[, common_genes]
+test_X_aligned  <- test_X[, common_genes]
+
+length(common_genes)
+```
+
+```{r}
+# 4. Train the random forest
+set.seed(3888)
+rf_model <- randomForest(x = train_X_aligned, y = train_y, ntree = 500, importance = TRUE)
+
+# 5. Predict and evaluate
+rf_preds <- predict(rf_model, newdata = test_X_aligned)
+
+conf_mat <- confusionMatrix(rf_preds, test_y)
+print(conf_mat)
+
+cat("Test Accuracy:", round(conf_mat$overall["Accuracy"], 3), "\n")
+```
+
+```{r}
+table(rf_preds)
+table(test_y)
+table(train_y)
+```
+
+```{r}
+merged_expr <- cbind(expr_matrix_67472[common_genes, ], expr_matrix_40732[common_genes, ])
+merged_expr_t <- as.data.frame(t(merged_expr))
+```
+
+```{r}
+dataset_labels <- c(rep("GSE67472", ncol(expr_matrix_67472)),
+                    rep("GSE40732", ncol(expr_matrix_40732)))
+```
+
+```{r}
+# Transpose BEFORE plotting so that each box represents a sample
+merged_expr_samplewise <- as.data.frame(t(merged_expr))  # samples as rows
+
+boxplot(as.data.frame(t(merged_expr_samplewise)),
+        main = "Expression Distributions by Sample",
+        las = 2,
+        col = ifelse(dataset_labels == "GSE67472", "#66c2a5", "#fc8d62"),
+        outline = FALSE,
+        ylab = "Expression")
+
+legend("topright", legend = c("GSE67472", "GSE40732"),
+       fill = c("#66c2a5", "#fc8d62"), cex = 0.8)
+```
+
+```{r}
+# Perform PCA
+pca_res <- prcomp(merged_expr_t, scale. = TRUE)
+
+# Prepare PCA data frame
+pca_df <- data.frame(PC1 = pca_res$x[, 1],
+                     PC2 = pca_res$x[, 2],
+                     Dataset = dataset_labels)
+
+# Plot
+library(ggplot2)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA of Combined Expression Data",
+       x = "PC1",
+       y = "PC2") +
+  scale_color_manual(values = c("GSE67472" = "#66c2a5", "GSE40732" = "#fc8d62"))
+```
+
+## Assessing 67472 merge appropriateness
+
+```{r}
+library(limma)
+
+# Create group labels (Asthma vs Control)
+group_67472 <- factor(ifelse(grepl("asthma", pheno_data_67472$`disease state:ch1`, ignore.case = TRUE), "Asthma", "Control"))
+
+# 2. Create design matrix
+design_67472 <- model.matrix(~0 + group_67472)
+colnames(design_67472) <- levels(group_67472)
+
+# 3. Fit linear model on expr_matrix_67472
+fit_67472 <- lmFit(expr_matrix_67472, design_67472)
+
+# 4. Create contrast: Asthma vs Control
+contrast_67472 <- makeContrasts(Asthma - Control, levels = design_67472)
+fit2_67472 <- contrasts.fit(fit_67472, contrast_67472)
+fit2_67472 <- eBayes(fit2_67472)
+
+# 5. Get all DE results
+de_results_67472 <- topTable(fit2_67472, number = Inf, sort.by = "P")
+
+# Quick check
+head(de_results_67472)
+```
+
+```{r}
+sum(de_results_67472$adj.P.Val < 0.05)
+```
+
+```{r}
+signif_de_67472 <- rownames(de_results_67472)[order(de_results_67472$P.Value)][1:1536]
+top100_67472 <- rownames(de_results_67472)[order(de_results_67472$P.Value)][1:100]
+top100_shared_both <- intersect(top100_40732, top100_67472)
+print(top100_shared_both)
+```
+
+## Loading 143303 dataset and running random forest to confirm it can be merged
+
+```{r}
+cache_dir <- tempdir()  # Get the temporary directory
+cache_files <- list.files(cache_dir, pattern = "GSE143303", full.names = TRUE)
+
+# Remove any cached files related to GSE143304
+file.remove(cache_files)
+library(GEOquery)
+gse143303 <- getGEO("GSE143303", GSEMatrix = TRUE)
+
+```
+
+```{r}
+expr_matrix_gse143303 <- exprs(gse143303[[1]])  # Expression data from GSE143304
+fdata_gse143303 <- fData(gse143303[[1]])  # Feature data from GSE143304
+expr_df_gse143303 <- as.data.frame(expr_matrix_gse143303)
+
+```
+
+```{r}
+expr_df_gse143303 <- as.data.frame(expr_matrix_gse143303)
+expr_df_gse143303$Symbol <- fdata_gse143303$Symbol[match(rownames(expr_df_gse143303), rownames(fdata_gse143303))]
+expr_df_gse143303 <- expr_df_gse143303[, c("Symbol", setdiff(names(expr_df_gse143303), "Symbol"))]
+expr_df_gse143303$Symbol <- as.character(fdata_gse143303$Symbol)
+expr_df_gse143303$Symbol <- as.character(expr_df_gse143303$Symbol)
+```
+
+```{r}
+expr_df_gse143303_clean <- expr_df_gse143303[!is.na(expr_df_gse143303$Symbol), ]
+ 
+```
+
+```{r}
+#head(expr_df_gse143303)
+
+
+expr_aggregated_gse143303 <- expr_df_gse143303_clean %>%
+  group_by(Symbol) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE))
+
+expr_matrix_gse143303_cleaned <- as.data.frame(expr_aggregated_gse143303)
+
+# Set 'Symbol' as row names and remove it from the data frame since it is now row names
+rownames(expr_matrix_gse143303_cleaned) <- expr_matrix_gse143303_cleaned$Symbol
+expr_matrix_gse143303_cleaned$Symbol <- NULL  # Remove 'Symbol' column
+
+# View the cleaned expression matrix
+head(expr_matrix_gse143303_cleaned)
+
+```
+
+```{r}
+common_genes <- intersect(rownames(expr_matrix_gse143303_cleaned), rownames(expr_matrix_40732))
+
+# Print the number of common genes
+cat("Number of common genes:", length(common_genes), "\n")
+cat("First few common genes:", head(common_genes), "\n")
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+
+expr_gse143303_subset <- expr_matrix_gse143303_cleaned[common_genes, ]
+expr_gse47302_subset <- expr_matrix_40732[common_genes, ]
+
+# Step 3: Combine the two datasets into a single long format data frame
+# Add a Dataset column to differentiate the two datasets
+expr_gse143303_long <- as.data.frame(expr_gse143303_subset) %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Expression") %>%
+  mutate(Dataset = "GSE143303")
+
+expr_gse47302_long <- as.data.frame(expr_gse47302_subset) %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Expression") %>%
+  mutate(Dataset = "GSE47302")
+
+
+```
+
+```{r}
+library(caret)
+library(randomForest)
+pData_gse143303 <- pData(gse143303[[1]])
+train_data <- expr_matrix_gse143303_cleaned[common_genes, ]  # Training data (GSE143303)
+test_data <- expr_matrix_40732[common_genes, ]    
+
+common_genes <- intersect(rownames(train_data), rownames(test_data))
+
+# Step 2: Subset the training and test data to include only the common genes
+train_data_subset <- train_data[common_genes, ]  # Subset training data with common genes
+test_data_subset <- test_data[common_genes, ]  
+
+
+# Step 2: Prepare the training data with a response variable
+# Assuming you have a target variable (e.g., "asthma") in GSE143303 for training
+# For demonstration, let's assume we want to predict a binary outcome for asthma (0 = non-asthma, 1 = asthma)
+train_labels <- ifelse(pData_gse143303$characteristics_ch1.1 == "disease status: Severe asthma", 1, 0)
+
+cat("Number of train_labels:", length(train_labels), "\n")
+cat("Number of columns in train_data:", ncol(train_data_subset), "\n")
+
+train_data_long <- as.data.frame(t(train_data_subset))
+colnames(train_data_long) <- rownames(train_data_subset)  # Assign gene names as column names
+
+train_data_long$Label <- train_labels
+# Confirm if 'Label' is in the columns
+cat("Is 'Label' in train_data_long?", "Label" %in% colnames(train_data_long), "\n")
+
+
+test_data_long <- as.data.frame(t(test_data_subset))
+train_labels <- as.factor(train_labels)
+
+# Check if train_labels is now a factor
+cat("Is train_labels a factor?", is.factor(train_labels), "\n")
+
+
+
+colnames(train_data_long) <- tolower(trimws(colnames(train_data_long)))
+colnames(test_data_long) <- tolower(trimws(colnames(test_data_long)))
+colnames(train_data_long) <- gsub("-", "_", colnames(train_data_long))  # Replace hyphens with underscores in training data
+colnames(test_data_long) <- gsub("-", "_", colnames(test_data_long))
+
+
+
+# Remove the 'ankhd1_eif4ebp3' gene from the test dataset (if it's present in test_data_long)
+train_data_long <- train_data_long[, !colnames(train_data_long) %in% "ankhd1_eif4ebp3"]
+test_data_long <- test_data_long[, !colnames(test_data_long) %in% "ankhd1_eif4ebp3"]
+
+missing_in_test <- setdiff(colnames(train_data_long), colnames(test_data_long))
+cat("Genes in train_data_long but not in test_data_long:", missing_in_test, "\n")
+
+# Find genes that are in test_data_long but not in train_data_long
+missing_in_train <- setdiff(colnames(test_data_long), colnames(train_data_long))
+cat("Genes in test_data_long but not in train_data_long:", missing_in_train, "\n")
+
+
+
+rf_model <- randomForest(label ~ ., data = train_data_long, ntree = 500)  # ntree = 500 trees
+
+# Step 4: Test the model on GSE47302 (Test data)
+#test_data_long <- as.data.frame(t(test_data_subset))
+predictions <- predict(rf_model, newdata = test_data_long)
+
+
+# Convert predictions to binary (0 or 1)
+predicted_labels <- ifelse(predictions > 0.5, 1, 0)
+
+# Step 5: Evaluate model performance (e.g., accuracy, confusion matrix)
+# Assuming you have true labels for the test set
+test_labels <- ifelse(pheno_data_40732$characteristics_ch1 == "asthma: TRUE", 1, 0)
+
+# Create confusion matrix
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_labels))
+
+# Print evaluation metrics
+print(conf_matrix)
+```
+
+```{r}
+train_data_long_pca <- t(train_data_long)  # Transpose the training data
+test_data_long_pca <- t(test_data_long)
+train_data_long_pca <- train_data_long_pca[rownames(train_data_long_pca) != "label", ]
+
+cat("Dimensions of transposed train data:", dim(train_data_long_pca), "\n")
+cat("Dimensions of transposed test data:", dim(test_data_long_pca), "\n")
+
+combined_data <- cbind(train_data_long_pca, test_data_long_pca)
+
+# Check the dimensions of combined_data to verify
+cat("Dimensions of combined_data:", dim(combined_data), "\n")
+```
+
+```{r}
+combined_data_pca<- combined_data
+
+
+pca <- prcomp(t(combined_data_pca), center = TRUE, scale. = TRUE)
+
+# Create a PCA plot (example)
+pca_df <- data.frame(pca$x)  # Extract PCA results
+
+# Add dataset labels (for visualization purposes)
+pca_df$Dataset <- c(rep("GSE143303", ncol(train_data_long_pca)), rep("GSE47302", ncol(test_data_long_pca)))
+
+cat("Dimensions of pca_df:", dim(pca_df), "\n")
+cat("Length of Dataset column:", length(pca_df$Dataset), "\n")
+
+# Plot PCA
+library(ggplot2)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 3) +
+  labs(title = "PCA of Gene Expression",
+       x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+
+## Assessing 143303 merge appropriateness
+
+```{r}
+library(limma)
+
+# Expression matrix = expr_matrix_gse143303_cleaned
+# Phenotype data:
+pheno_data_gse143303 <- pData(gse143303[[1]])
+
+# Clean sample names if needed (GSM IDs match)
+colnames(expr_matrix_gse143303_cleaned) <- sub("_.*", "", colnames(expr_matrix_gse143303_cleaned))
+pheno_data_gse143303 <- pheno_data_gse143303[colnames(expr_matrix_gse143303_cleaned), ]
+
+# Create group labels (Severe asthma vs others)
+group_143303_cleaned <- factor(ifelse(pheno_data_gse143303$characteristics_ch1.1 == "disease status: Severe asthma", "Asthma", "Control"))
+
+# Build design matrix
+design_143303_cleaned <- model.matrix(~0 + group_143303_cleaned)
+colnames(design_143303_cleaned) <- levels(group_143303_cleaned)
+
+# Fit linear model
+fit_143303_cleaned <- lmFit(expr_matrix_gse143303_cleaned, design_143303_cleaned)
+
+# Create contrast: Asthma vs Control
+contrast_143303_cleaned <- makeContrasts(Asthma - Control, levels = design_143303_cleaned)
+fit2_143303_cleaned <- contrasts.fit(fit_143303_cleaned, contrast_143303_cleaned)
+fit2_143303_cleaned <- eBayes(fit2_143303_cleaned)
+
+# Extract DE results
+de_results_143303 <- topTable(fit2_143303_cleaned, number = Inf, sort.by = "P")
+
+# Quick view
+head(de_results_143303)
+
+signif_de_143303 <- rownames(de_results_143303)[order(de_results_143303$P.Value)][1:2043]
+
+# Top 100 genes (gene symbols)
+top100_143303 <- rownames(de_results_143303)[order(de_results_143303$P.Value)][1:100]
+
+# View
+print(top100_143303)
+
+```
+
+```{r}
+print(top100_40732)
+```
+
+```{r}
+shared_top100_genes_143303 <- intersect(top100_40732, top100_143303)
+
+# View shared genes
+print(shared_top100_genes_143303)
+
+# How many shared?
+length(shared_top100_genes_143303)
+```
+
+```{r}
+shared_signif_143303x67472 <- intersect(signif_de_143303, signif_de_67472)
+
+# View shared genes
+print(shared_signif_143303x67472)
+
+# How many shared?
+length(shared_signif_143303x67472)
+```
+
+### Kimi's stuff
+
+```{r}
+gene_means <- rowMeans(combined_data, na.rm = TRUE)
+
+# Get the top 100 genes with the highest mean expression
+top_100_genes <- names(sort(gene_means, decreasing = TRUE))[1:100]
+
+# Subset the combined data to include only the top 100 genes
+top_100_data <- combined_data[top_100_genes, ]
+
+# Reshape the data to long format for ggplot
+library(tidyr)
+top_100_data_long <- as.data.frame(top_100_data) %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Expression") %>%
+  mutate(Dataset = ifelse(Sample %in% colnames(train_data_long), "GSE143303", "GSE47302"))
+
+```
+
+## Loading 40888
+
+```{r}
+gse_40888 <- getGEO(filename = "data/GSE40888_series_matrix.txt.gz")
+```
+
+```{r}
+expr_matrix_40888 <- exprs(gse_40888)
+dim(expr_matrix_40888)
+head(expr_matrix_40888[, 1:5])
+
+pheno_data_40888 <- pData(gse_40888)
+head(pheno_data_40888, 20)
+
+feature_data_40888 <- fData(gse_40888)
+head(feature_data_40888, 20)
+```
+
+```{r}
+colnames(feature_data_40888)
+```
+
+```{r}
+# Extract probe ID → SYMBOL correspondence (from gene_assignment)
+library(dplyr)
+library(stringr)
+
+probe2symbol <- feature_data_40888 %>%
+  mutate(SYMBOL = str_split_fixed(gene_assignment, " // ", 3)[,2]) %>%
+  select(ID, SYMBOL) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "")
+```
+
+```{r}
+# Combining expression matrices with SYMBOL
+expr_df_40888 <- as.data.frame(expr_matrix_40888)
+expr_df_40888$ID <- rownames(expr_df_40888)
+
+expr_annotated_40888 <- merge(expr_df_40888, probe2symbol, by = "ID")
+
+# Aggregate the expression values of multiple probes for the same gene 
+expr_clean_40888 <- expr_annotated_40888 %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+expr_matrix_40888_clean <- as.data.frame(expr_clean_40888)
+rownames(expr_matrix_40888_clean) <- expr_matrix_40888_clean$SYMBOL
+expr_matrix_40888_clean$SYMBOL <- NULL
+
+# --- PCA-based split for raw GSE40888 (before any ComBat) ---
+pca_40888 <- prcomp(t(expr_matrix_40888_clean), center = TRUE, scale. = TRUE)
+split_labels_40888 <- ifelse(pca_40888$x[, 1] > 0, "batch1", "batch2")
+
+samples_40888_batch1 <- rownames(pca_40888$x)[split_labels_40888 == "batch1"]
+samples_40888_batch2 <- rownames(pca_40888$x)[split_labels_40888 == "batch2"]
+
+raw_40888_batch1 <- expr_matrix_40888_clean[, samples_40888_batch1]
+raw_40888_batch2 <- expr_matrix_40888_clean[, samples_40888_batch2]
+
+# === Merge raw (pre-ComBat) expression matrix for 7 datasets ===
+
+# Step 1: Get common genes across all 7 datasets
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(raw_40888_batch1),
+  rownames(raw_40888_batch2),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(raw_67472_batch1),
+  rownames(raw_67472_batch2),
+  rownames(expr_matrix_40732)
+))
+
+# Step 2: Combine into one matrix (raw, uncorrected)
+merged_raw_7 <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  raw_40888_batch1[common_genes_all, ],
+  raw_40888_batch2[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  raw_67472_batch1[common_genes_all, ],
+  raw_67472_batch2[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ]
+)
+
+# Step 3: Export to CSV
+write.csv(merged_raw_7, "expression_7datasets_preCombat.csv")
+
+
+expr_matrix_40888_clean
+```
+
+```{r}
+symbols_40888 <- rownames(expr_matrix_40888_clean)
+```
+
+## Assessing 40888 for merge appropriateness
+
+```{r}
+library(limma)
+
+# Create group labels (Severe asthma vs others)
+group_40888_cleaned <- factor(ifelse(grepl("asthmatic", pheno_data_40888$`characteristics_ch1.3`, ignore.case = TRUE), "Asthma", "Control"))
+
+# Build design matrix
+design_40888_cleaned <- model.matrix(~0 + group_40888_cleaned)
+colnames(design_40888_cleaned) <- levels(group_40888_cleaned)
+
+# Fit linear model
+fit_40888_cleaned <- lmFit(expr_matrix_40888_clean, design_40888_cleaned)
+
+# Create contrast: Asthma vs Control
+contrast_40888_cleaned <- makeContrasts(Asthma - Control, levels = design_40888_cleaned)
+fit2_40888_cleaned <- contrasts.fit(fit_40888_cleaned, contrast_40888_cleaned)
+fit2_40888_cleaned <- eBayes(fit2_40888_cleaned)
+
+# Extract DE results
+de_results_40888 <- topTable(fit2_40888_cleaned, number = Inf, sort.by = "P")
+
+# Quick view
+head(de_results_40888)
+
+signif_de_40888 <- rownames(de_results_40888)[order(de_results_40888$P.Value)][1:1029]
+
+# Top 100 genes (gene symbols)
+top100_40888 <- rownames(de_results_40888)[order(de_results_40888$P.Value)][1:100]
+
+# View
+print(top100_40888)
+
+```
+
+```{r}
+shared_top100_genes_40888 <- intersect(top100_40732, top100_40888)
+
+# View shared genes
+print(shared_top100_genes_40888)
+
+# How many shared?
+length(shared_top100_genes_40888)
+```
+
+```{r}
+shared_signif_143303x67472x40888 <- intersect(intersect(signif_de_143303, signif_de_67472), signif_de_40888)
+
+# View shared genes
+print(shared_signif_143303x67472x40888)
+
+# How many shared?
+length(shared_signif_143303x67472x40888)
+```
+
+```{r}
+shared_signif_67472x40888 <- intersect(signif_de_40888, signif_de_67472)
+
+# View shared genes
+print(shared_signif_67472x40888)
+
+# How many shared?
+length(shared_signif_67472x40888)
+```
+
+```{r}
+shared_signif_143303x40888 <- intersect(signif_de_40888, signif_de_143303)
+
+# View shared genes
+print(shared_signif_143303x40888)
+
+# How many shared?
+length(shared_signif_143303x40888)
+```
+
+## Loading 188424
+
+```{r}
+# --- Step 2: Load GSE188424 dataset ---
+gse188424 <- getGEO(filename = "data/GSE188424_series_matrix.txt.gz")
+```
+
+```{r}
+# --- Step 3: Extract expression matrix, phenotype and feature data ---
+expr_matrix_188424 <- exprs(gse188424)
+pheno_data_188424 <- pData(gse188424)
+feature_data_188424 <- fData(gse188424)
+
+head(expr_matrix_188424,20)
+head(pheno_data_188424,20)
+head(feature_data_188424,20)
+```
+
+```{r}
+# Load GEO platform annotation
+platform_id <- annotation(gse188424)  # Get platform ID, e.g., GPLxxxx
+platform <- getGEO(platform_id)
+feature_data <- Table(platform)
+
+# Extract probe ID and gene symbol mapping
+feature_map_188424 <- feature_data[, c("ID", "Symbol")]
+colnames(feature_map_188424) <- c("probe_id", "symbol")
+
+# Step 3: Map probe IDs in expr_matrix_188424 to gene symbols 
+expr_df_188424 <- as.data.frame(expr_matrix_188424)
+expr_df_188424$probe_id <- rownames(expr_df_188424)
+
+expr_annotated_188424 <- merge(expr_df_188424, feature_map_188424, by = "probe_id", all.x = TRUE)
+
+# Move 'symbol' column to the front
+expr_annotated_188424 <- expr_annotated_188424[, c("symbol", setdiff(names(expr_annotated_188424), "symbol"))]
+
+# Remove rows with missing gene symbols 
+expr_annotated_188424_clean <- expr_annotated_188424[!is.na(expr_annotated_188424$symbol), ]
+
+# Aggregate expression values by gene symbol 
+library(dplyr)
+expr_aggregated_188424 <- expr_annotated_188424_clean %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+# Format back to matrix 
+expr_matrix_188424_cleaned <- as.data.frame(expr_aggregated_188424)
+rownames(expr_matrix_188424_cleaned) <- expr_matrix_188424_cleaned$symbol
+expr_matrix_188424_cleaned$symbol <- NULL
+
+
+
+```
+
+```{r}
+# --- Step 5: Remove NA symbols and aggregate by symbol ---
+expr_annotated_188424_clean <- expr_annotated_188424[!is.na(expr_annotated_188424$symbol), ]
+
+expr_aggregated_188424 <- expr_annotated_188424_clean %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+```
+
+```{r}
+# --- Step 6: Final training expression matrix ---
+expr_matrix_188424_clean <- as.data.frame(expr_aggregated_188424)
+rownames(expr_matrix_188424_clean) <- expr_matrix_188424_clean$symbol
+expr_matrix_188424_clean$symbol <- NULL
+
+head(expr_matrix_188424_clean, 20)
+
+```
+
+```{r}
+# --- Step 7: Prepare labels (Controlled / Uncontrolled) ---
+title_labels <- pheno_data_188424$title
+condition <- gsub(" .*", "", title_labels)  
+table(condition)
+
+# Align condition with training samples
+condition <- condition[1:ncol(expr_matrix_188424_clean)]
+selected <- condition %in% c("Controlled", "Uncontrolled")
+condition <- condition[1:ncol(expr_matrix_188424_clean)]
+train_y <- ifelse(condition[selected] == "Controlled", 1, 0)
+train_y <- as.factor(train_y)
+```
+
+```{r}
+# --- Step 8: Model training ---
+# --- Step 8: Prepare train_X and train_y and run model ---
+# Transpose expression matrix so rows = samples, columns = genes
+train_X <- as.data.frame(t(expr_matrix_188424_clean[, selected]))
+
+# Make sure labels are a factor
+train_y <- as.factor(ifelse(condition[selected] == "Controlled", 1, 0))
+
+# Confirm dimensions match
+stopifnot(nrow(train_X) == length(train_y))
+
+# Train the random forest
+set.seed(3888)
+rf_model <- randomForest(x = train_X, y = train_y, ntree = 500, importance = TRUE)
+```
+
+```{r}
+# Align common genes
+shared_genes_188424 <- intersect(rownames(expr_matrix_188424_clean), rownames(expr_matrix_40732))
+
+length(shared_genes_188424)
+```
+
+```{r}
+# Merge the two datasets
+combined_data <- cbind(
+  expr_matrix_188424_cleaned[common_genes, ],
+  expr_matrix_40732[common_genes, ]
+)
+
+# Transpose the matrix 
+# Rows become samples, columns become genes
+combined_data_t <- t(combined_data)
+
+# Standardize the data 
+# For each gene (column), scale to mean = 0 and variance = 1
+combined_data_scaled <- scale(combined_data_t)
+```
+
+```{r}
+sum(is.na(combined_data_scaled))       # Should be 0
+sum(is.infinite(combined_data_scaled)) # Should be 0
+```
+
+```{r}
+# Remove genes (columns) with any NA values
+combined_data_scaled_clean <- combined_data_scaled[, colSums(is.na(combined_data_scaled)) == 0]
+
+# Perform PCA 
+pca_result <- prcomp(combined_data_scaled_clean, center = TRUE, scale. = TRUE)
+
+# Organize PCA results into a dataframe 
+pca_df <- data.frame(pca_result$x)
+
+# Add dataset labels for each sample 
+pca_df$Dataset <- ifelse(
+  rownames(pca_df) %in% colnames(expr_matrix_188424_cleaned),
+  "GSE188424",
+  "GSE40732"
+)
+
+# Plot PCA 
+library(ggplot2)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 2) +
+  labs(title = "PCA of Combined Expression Data",
+       x = "PC1", y = "PC2") +
+  theme_minimal()
+
+
+```
+
+## Assessing 188424 for merge appropriateness
+
+```{r}
+library(limma)
+
+
+# Create group labels (Severe asthma vs others)
+group_188424_cleaned <- factor(ifelse(pheno_data_188424$description == "Uncontrolled", "Asthma", "Control"))
+
+# Build design matrix
+design_188424_cleaned <- model.matrix(~0 + group_188424_cleaned)
+colnames(design_188424_cleaned) <- levels(group_188424_cleaned)
+
+# Fit linear model
+fit_188424_cleaned <- lmFit(expr_matrix_188424_clean, design_188424_cleaned)
+
+# Create contrast: Asthma vs Control
+contrast_188424_cleaned <- makeContrasts(Asthma - Control, levels = design_188424_cleaned)
+fit2_188424_cleaned <- contrasts.fit(fit_188424_cleaned, contrast_188424_cleaned)
+fit2_188424_cleaned <- eBayes(fit2_188424_cleaned)
+
+# Extract DE results
+de_results_188424 <- topTable(fit2_188424_cleaned, number = Inf, sort.by = "P")
+
+# Quick view
+head(de_results_188424)
+
+signif_de_188424 <- rownames(de_results_188424)[order(de_results_188424$P.Value)][1:38]
+
+# Top 100 genes (gene symbols)
+top100_188424 <- rownames(de_results_188424)[order(de_results_188424$P.Value)][1:100]
+
+# View
+print(top100_188424)
+
+```
+
+## Loading 64913
+
+```{r}
+# 1. Load GSE64913
+gse_64913 <- getGEO(filename = "data/GSE64913_series_matrix.txt.gz")
+
+# 2. Extract expression matrix
+expr_matrix_64913 <- exprs(gse_64913)
+dim(expr_matrix_64913)
+head(expr_matrix_64913[, 1:5])
+
+# 3. Extract phenotype (sample info)
+pheno_data_64913 <- pData(gse_64913)
+head(pheno_data_64913, 100)
+
+# 4. Extract feature data (probe annotations)
+feature_data_64913 <- fData(gse_64913)
+head(feature_data_64913, 20)
+```
+
+```{r}
+colnames(feature_data_64913)
+```
+
+```{r}
+if ("Gene Symbol" %in% colnames(feature_data_64913)) {
+  probe2symbol_64913 <- feature_data_64913 %>%
+    select(ID, SYMBOL = `Gene Symbol`) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "")
+} else if ("gene_assignment" %in% colnames(feature_data_64913)) {
+  # Fallback for gene_assignment format (like 40888)
+  probe2symbol_64913 <- feature_data_64913 %>%
+    mutate(SYMBOL = str_split_fixed(gene_assignment, " // ", 3)[,2]) %>%
+    select(ID, SYMBOL) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "")
+}
+```
+
+```{r}
+# Merge expression data with SYMBOL
+expr_df_64913 <- as.data.frame(expr_matrix_64913)
+expr_df_64913$ID <- rownames(expr_df_64913)
+
+expr_annotated_64913 <- merge(expr_df_64913, probe2symbol_64913, by = "ID")
+
+# Collapse multiple probes per gene by averaging
+expr_clean_64913 <- expr_annotated_64913 %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+expr_matrix_64913_clean <- as.data.frame(expr_clean_64913)
+rownames(expr_matrix_64913_clean) <- expr_matrix_64913_clean$SYMBOL
+expr_matrix_64913_clean$SYMBOL <- NULL
+
+# View cleaned matrix
+head(expr_matrix_64913_clean)
+```
+
+```{r}
+symbols_64913 <- rownames(expr_matrix_64913_clean)
+
+```
+
+```{r}
+shared_genes_64913 <- intersect(symbols_64913, symbols_40732)
+
+# View
+length(shared_genes_64913)
+```
+
+## Assessing 64913
+
+```{r}
+library(limma)
+
+# Create group labels for GSE64913
+# Check which field separates asthma vs control in pheno_data_64913
+# (Example below assumes 'disease status:ch1' or similar field)
+
+group_64913_cleaned <- factor(ifelse(grepl("Asthmatic", pheno_data_64913$characteristics_ch1.1, ignore.case = TRUE), "Asthma", "Control"))
+
+# Build design matrix
+design_64913_cleaned <- model.matrix(~0 + group_64913_cleaned)
+colnames(design_64913_cleaned) <- levels(group_64913_cleaned)
+
+# Fit linear model
+fit_64913_cleaned <- lmFit(expr_matrix_64913_clean, design_64913_cleaned)
+
+# Create contrast: Asthma vs Control
+contrast_64913_cleaned <- makeContrasts(Asthma - Control, levels = design_64913_cleaned)
+fit2_64913_cleaned <- contrasts.fit(fit_64913_cleaned, contrast_64913_cleaned)
+fit2_64913_cleaned <- eBayes(fit2_64913_cleaned)
+
+# Extract DE results
+de_results_64913 <- topTable(fit2_64913_cleaned, number = Inf, sort.by = "P")
+
+# View results
+head(de_results_64913)
+sum(de_results_64913$adj.P.Val < 0.05)
+
+signif_de_64913 <- rownames(de_results_64913)[order(de_results_64913$P.Value)][1:915]
+
+# Top 100 genes (gene symbols)
+top100_64913 <- rownames(de_results_64913)[order(de_results_64913$P.Value)][1:100]
+
+```
+
+```{r}
+# 64913 x 67472
+shared_signif_64913x67472 <- intersect(signif_de_64913, signif_de_67472)
+cat("64913 x 67472 shared genes:", length(shared_signif_64913x67472), "\n")
+
+# 64913 x 143303
+shared_signif_64913x143303 <- intersect(signif_de_64913, signif_de_143303)
+cat("64913 x 143303 shared genes:", length(shared_signif_64913x143303), "\n")
+
+# 64913 x 40888
+shared_signif_64913x40888 <- intersect(signif_de_64913, signif_de_40888)
+cat("64913 x 40888 shared genes:", length(shared_signif_64913x40888), "\n")
+
+# 64913 x 40888 x 143303
+shared_signif_64913x40888x143303 <- intersect(signif_de_64913, intersect(signif_de_40888, signif_de_143303))
+cat("64913 x 40888 x 143303 shared genes:", length(shared_signif_64913x40888x143303), "\n")
+```
+
+```{r}
+# 64913 x 40888 x 143303
+shared_64913x40888x143303 <- intersect(rownames(expr_matrix_64913_clean), intersect(rownames(expr_matrix_40888_clean),rownames(expr_matrix_gse143303_cleaned)))
+cat("64913 x 40888 x 143303 shared genes:", length(shared_64913x40888x143303), "\n")
+
+# 64913 x 40888 x 143303 x 67472
+shared_64913x40888x143303x67472 <- intersect(intersect(rownames(expr_matrix_64913_clean), rownames(expr_matrix_67472)), intersect(rownames(expr_matrix_40888_clean),rownames(expr_matrix_gse143303_cleaned)))
+cat("64913 x 40888 x 143303 x 67472 shared genes:", length(shared_64913x40888x143303x67472), "\n")
+
+# 64913 x 40888 x 143303 x 67472 x 40732
+shared_64913x40888x143303x67472x40732 <- intersect(intersect(rownames(expr_matrix_40732), intersect(rownames(expr_matrix_64913_clean), rownames(expr_matrix_67472))), intersect(rownames(expr_matrix_40888_clean),rownames(expr_matrix_gse143303_cleaned)))
+cat("64913 x 40888 x 143303 x 67472 x 40732 shared genes:", length(shared_64913x40888x143303x67472x40732), "\n")
+```
+
+```{r}
+common_genes_train <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40888_clean),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472)
+))
+length(common_genes_train)
+```
+
+```{r}
+merged_train <- cbind(
+  expr_matrix_64913_clean[common_genes_train, ],
+  expr_matrix_40888_clean[common_genes_train, ],
+  expr_matrix_gse143303_cleaned[common_genes_train, ],
+  expr_matrix_67472[common_genes_train, ]
+)
+
+# Transpose for sample-wise rows
+merged_train_t <- t(merged_train)
+```
+
+```{r}
+# --- Adjust batch effects using ComBat ---
+library(sva)
+
+# 1. Merge train and test datasets with common genes
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40888_clean),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472),
+  rownames(expr_matrix_40732)  # include test set!
+))
+
+merged_full <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40888_clean[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ]
+)
+
+# 2. Construct batch labels
+full_batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888", ncol(expr_matrix_40888_clean)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472", ncol(expr_matrix_67472)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+
+# 3. Apply ComBat
+combat_corrected_full <- ComBat(dat = merged_full, batch = full_batch_labels, par.prior = TRUE)
+
+# 4. Split into train and test
+n_train <- length(full_batch_labels) - ncol(expr_matrix_40732)
+combat_train <- combat_corrected_full[, 1:n_train]
+combat_test  <- combat_corrected_full[, (n_train + 1):ncol(combat_corrected_full)]
+
+# 5. Transpose train matrix for randomForest
+combat_train_t <- as.data.frame(t(combat_train))
+
+```
+
+```{r}
+
+pheno_data_64913 <- pheno_data_64913[colnames(expr_matrix_64913_clean), ]
+pheno_data_40888 <- pheno_data_40888[colnames(expr_matrix_40888_clean), ]
+pheno_data_gse143303 <- pheno_data_gse143303[colnames(expr_matrix_gse143303_cleaned), ]
+pheno_data_67472 <- pheno_data_67472[colnames(expr_matrix_67472), ]
+
+labels_64913 <- ifelse(grepl("Asthmatic", pheno_data_64913$characteristics_ch1.1, ignore.case = TRUE), "Asthma", "Control")
+labels_40888 <- ifelse(grepl("asthmatic", pheno_data_40888$`characteristics_ch1.3`, ignore.case = TRUE), "Asthma", "Control")
+labels_143303 <- ifelse(pheno_data_gse143303$characteristics_ch1.1 == "disease status: Severe asthma", "Asthma", "Control")
+labels_67472 <- ifelse(grepl("asthma", pheno_data_67472$`disease state:ch1`, ignore.case = TRUE), "Asthma", "Control")
+
+train_labels <- factor(c(labels_64913, labels_40888, labels_143303, labels_67472))
+
+```
+
+```{r}
+dim(combat_train_t)      # Should be: samples x genes
+length(train_labels)    # Should equal number of rows in combat_expr_t
+
+```
+
+```{r}
+# Use combat_corrected_full to find common genes with the test set
+common_genes_test <- intersect(rownames(expr_matrix_40732), rownames(combat_corrected_full))
+
+# Subset the corrected matrix for test samples (i.e., GSE40732 samples)
+test_expr_40732 <- combat_corrected_full[common_genes_test, colnames(expr_matrix_40732)]
+
+```
+
+```{r}
+test_expr_40732_t <- t(test_expr_40732)
+```
+
+```{r}
+test_labels <- factor(ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control"))
+
+```
+
+```{r}
+# Step 1: Get genes shared across all datasets (including GSE40732)
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40888_clean),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472),
+  rownames(expr_matrix_40732)
+))
+
+# Step 2: Combine ALL uncorrected expression matrices
+merged_full <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40888_clean[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ]
+)
+
+# Step 3: Construct full batch labels (must match sample order in merged_full)
+full_batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888", ncol(expr_matrix_40888_clean)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472", ncol(expr_matrix_67472)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+
+library(sva)
+
+# --- Separate training and test data ---
+n_train <- length(full_batch_labels) - ncol(expr_matrix_40732)
+merged_train <- merged_full[, 1:n_train]
+train_batch_labels <- full_batch_labels[1:n_train]
+
+# Step 1: Run ComBat on training data
+combat_train <- ComBat(
+  dat = merged_train,
+  batch = train_batch_labels,
+  par.prior = TRUE
+)
+
+# Step 2: Estimate mean and variance from training data (manually)
+train_means <- rowMeans(combat_train, na.rm = TRUE)
+train_sds <- apply(combat_train, 1, sd, na.rm = TRUE)
+
+# Step 3: Save the estimates as a frozen model
+combat_frozen_model <- list(
+  stand.mean = train_means,
+  stand.sd = train_sds
+)
+
+saveRDS(combat_frozen_model, file = "combat_frozen_model_basic.rds")
+
+# Step 4: Run ComBat once across the full matrix
+combat_corrected_full <- ComBat(dat = merged_full, batch = full_batch_labels, par.prior = TRUE)
+
+
+saveRDS(combat_corrected_full, file = "frozen_combat_corrected_expr_primary_model.rds")
+```
+
+```{r}
+combat_test_t <- as.data.frame(t(combat_test))  # transpose so samples are rows
+
+# Step 1: Align test set with training genes
+train_genes <- colnames(combat_train_t)
+test_genes  <- colnames(combat_test_t)
+
+# Step 2: Find common genes
+common_genes <- intersect(train_genes, test_genes)
+
+# Step 3: Subset both training and test data to shared genes
+combat_train_t_aligned <- combat_train_t[, common_genes]
+combat_test_t_aligned  <- combat_test_t[, common_genes]
+
+# (Optional sanity check)
+stopifnot(all(colnames(combat_train_t_aligned) == colnames(combat_test_t_aligned)))
+
+```
+
+```{r}
+# Split corrected data into train and test sets
+n_train <- length(full_batch_labels) - ncol(expr_matrix_40732)
+
+combat_train <- combat_corrected_full[, 1:n_train]
+combat_test  <- combat_corrected_full[, (n_train + 1):ncol(combat_corrected_full)]
+```
+
+```{r}
+table(train_labels)
+```
+
+```{r}
+rf_model <- randomForest(x = combat_train_t_aligned, y = train_labels, ntree = 500)
+
+# Predict on test data
+rf_preds <- predict(rf_model, newdata = combat_test_t_aligned)
+
+# Evaluate
+conf_matrix <- confusionMatrix(rf_preds, test_labels)
+print(conf_matrix)
+
+cat("Test Accuracy:", round(conf_matrix$overall["Accuracy"], 3), "\n")
+
+```
+
+```{r}
+expr_for_boxplot <- as.data.frame(t(combat_train))  # use updated combat_train
+sample_ids <- colnames(combat_train)
+```
+
+```{r}
+# Align gene rows across train and test
+common_genes <- intersect(rownames(combat_train), rownames(combat_test))
+
+combat_train_aligned <- combat_train[common_genes, ]
+combat_test_aligned  <- combat_test[common_genes, ]
+
+# Define dataset labels
+batch_labels <- c(
+  rep("GSE64913", length(labels_64913)),
+  rep("GSE40888", length(labels_40888)),
+  rep("GSE143303", length(labels_143303)),
+  rep("GSE67472", length(labels_67472))
+)
+combined_dataset_labels <- c(
+  batch_labels,
+  rep("GSE40732", ncol(combat_test_aligned))
+)
+
+# Prepare expression matrix and metadata
+all_expr <- cbind(combat_train_aligned, combat_test_aligned)
+expr_for_boxplot <- as.data.frame(t(all_expr))
+expr_for_boxplot$Sample <- rownames(expr_for_boxplot)
+expr_for_boxplot$Dataset <- factor(combined_dataset_labels)
+
+# Reshape
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+expr_long <- expr_for_boxplot %>%
+  pivot_longer(-c(Sample, Dataset), names_to = "Gene", values_to = "Expression")
+
+expr_long$Sample <- factor(expr_long$Sample, levels = expr_for_boxplot$Sample[order(expr_for_boxplot$Dataset)])
+
+# Compute vertical boundaries and label positions
+sample_counts <- table(expr_for_boxplot$Dataset)
+dataset_boundaries <- cumsum(as.numeric(sample_counts))
+dataset_midpoints <- cumsum(c(0, as.numeric(sample_counts[-length(sample_counts)]))) + as.numeric(sample_counts) / 2
+dataset_names <- names(sample_counts)
+
+# Plot
+ggplot(expr_long, aes(x = Sample, y = Expression, fill = Dataset)) +
+  geom_boxplot(outlier.size = 0.2, outlier.alpha = 0.2, width = 0.4) +
+  geom_vline(xintercept = dataset_boundaries[-length(dataset_boundaries)] + 0.5,
+             linetype = "dashed", color = "grey40") +
+  annotate("text", x = dataset_midpoints,
+           y = max(expr_long$Expression, na.rm = TRUE) + 0.5,
+           label = dataset_names,
+           angle = 45, hjust = 0, size = 1.5) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(title = "Expression Distribution per Sample (Post-ComBat, Including Test Set)",
+       x = "Samples (Grouped by Dataset)", y = "Expression") +
+  scale_fill_brewer(palette = "Set2")
+```
+
+```{r}
+library(glmnet)
+
+train_matrix <- as.matrix(combat_train_t_aligned)
+test_matrix <- as.matrix(combat_test_t_aligned)
+
+train_y_bin <- ifelse(train_labels == "Asthma", 1, 0)
+
+lasso_model <- cv.glmnet(train_matrix, train_y_bin, family = "binomial", alpha = 1)
+lasso_probs <- predict(lasso_model, newx = test_matrix, s = "lambda.min", type = "response")
+lasso_preds <- factor(ifelse(lasso_probs > 0.5, "Asthma", "Control"))
+
+confusionMatrix(lasso_preds, test_labels)
+
+```
+
+```{r}
+library(limma)
+group_labels <- factor(ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control"))
+design <- model.matrix(~0 + group_labels)
+colnames(design) <- levels(group_labels)
+
+fit <- lmFit(expr_matrix, design)
+contrast <- makeContrasts(Asthma - Control, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+de_results <- topTable(fit2, number = Inf, sort.by = "P")  # This will now match your matrix
+
+
+# 6. View top hits
+head(de_results)
+```
+
+```{r}
+library(randomForest)
+
+# Transpose gene expression: rows = samples, columns = genes
+expr_t <- as.data.frame(t(expr_matrix))
+
+# Select top DE genes
+top_de_genes <- rownames(de_results)[de_results$adj.P.Val < 0.05]
+top_de_genes <- head(top_de_genes, 500)
+
+# Select top variable genes
+gene_vars <- apply(expr_t, 2, var, na.rm = TRUE)
+top_var_genes <- names(sort(gene_vars, decreasing = TRUE))[1:500]
+
+# Overlap
+common_genes <- intersect(top_de_genes, top_var_genes)
+
+# ---- CLEAN SUBSET FUNCTION ----
+clean_subset <- function(df, genes) {
+  # Force column names to be characters
+  colnames(df) <- as.character(colnames(df))
+  
+  # Ensure input gene list is also character
+  genes <- as.character(unlist(genes))  # If genes is a list, flatten it safely
+  
+  genes_present <- intersect(genes, colnames(df))
+  
+  if (length(genes_present) == 0) stop("No matching genes found in the data.")
+  
+  subset <- df[, genes_present, drop = FALSE]
+  
+  # Keep only columns that are fully numeric and finite
+  keep_cols <- sapply(subset, function(x) is.numeric(x) && all(is.finite(x)))
+  
+  subset <- subset[, keep_cols, drop = FALSE]
+  
+  as.data.frame(subset)
+}
+
+
+# Clean feature sets
+X_de     <- clean_subset(expr_t, top_de_genes)
+X_var    <- clean_subset(expr_t, top_var_genes)
+X_common <- clean_subset(expr_t, common_genes)
+
+# Train random forest models
+set.seed(3888)
+rf_de     <- randomForest(x = X_de, y = labels)
+rf_var    <- randomForest(x = X_var, y = labels)
+rf_common <- randomForest(x = X_common, y = labels)
+
+# Print training accuracy
+cat("Accuracy (DE):",      mean(rf_de$predicted     == labels), "\n")
+cat("Accuracy (Var):",     mean(rf_var$predicted    == labels), "\n")
+cat("Accuracy (DE ∩ Var):", mean(rf_common$predicted == labels), "\n")
+
+```
+
+```{r}
+# Check what's actually in your expression matrix
+head(rownames(expr_matrix), 10)
+
+# Check DE gene names
+head(top_de_genes, 10)
+
+# After transpose:
+head(colnames(expr_t), 10)
+
+```
+
+```{r}
+pca_6 = prcomp(t(expr_matrix_67472))
+batch_gse67472 = ifelse(pca_6$x[,"PC1"] > 0, "batch_1", "batch_2")
+pca_6$x %>%
+  data.frame() %>%
+  mutate(labels = labels_67472) %>%
+  ggplot(aes(x = PC1, y = PC2, color = labels)) + geom_point() + theme_bw()
+
+table(batch_gse67472, labels_67472)
+```
+
+```{r}
+library(caret)
+library(randomForest)
+
+datasets <- list(
+  GSE40732 = expr_matrix_40732,
+  GSE67472 = expr_matrix_67472,
+  GSE143303 = expr_matrix_gse143303_cleaned,
+  GSE40888 = expr_matrix_40888_clean,
+  GSE64913 = expr_matrix_64913_clean
+)
+
+
+# Set up 5-fold cross-validation
+set.seed(3888)
+cv_folds <- createFolds(train_labels, k = 5, returnTrain = TRUE)
+
+# Placeholder for accuracy results
+cv_accuracies <- c()
+
+# Run CV
+for (i in seq_along(cv_folds)) {
+  cat("Fold", i, "\n")
+  
+  # Split data
+  train_idx <- cv_folds[[i]]
+  test_idx  <- setdiff(seq_along(train_labels), train_idx)
+  
+  X_train <- combat_train_t_aligned[train_idx, ]
+  y_train <- train_labels[train_idx]
+  
+  X_test  <- combat_train_t_aligned[test_idx, ]
+  y_test  <- train_labels[test_idx]
+  
+  # Train model
+  rf_model <- randomForest(x = X_train, y = y_train, ntree = 500)
+  
+  # Predict
+  preds <- predict(rf_model, newdata = X_test)
+  
+  # Accuracy
+  acc <- mean(preds == y_test)
+  cv_accuracies[i] <- acc
+  cat("  Accuracy:", round(acc, 3), "\n")
+}
+
+# Final CV score
+cat("\nAverage 5-Fold CV Accuracy:", round(mean(cv_accuracies), 3), "\n")
+
+```
+
+```{r}
+# Load necessary library
+library(ggplot2)
+
+# Transpose the matrix: rows = samples, columns = genes
+expr_40732_t <- t(expr_matrix_40732)
+
+# Perform PCA
+pca_40732 <- prcomp(expr_40732_t, scale. = TRUE, center = TRUE)
+
+# Create PCA data frame
+pca_df_40732 <- data.frame(
+  PC1 = pca_40732$x[, 1],
+  PC2 = pca_40732$x[, 2],
+  Sample = rownames(pca_40732$x),
+  Label = ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control")
+)
+
+# Plot PCA
+ggplot(pca_df_40732, aes(x = PC1, y = PC2, color = Label)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA of GSE40732 Samples",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  scale_color_manual(values = c("Asthma" = "#d95f02", "Control" = "#1b9e77"))
+
+```
+
+```{r}
+# Load required library
+library(ggplot2)
+
+# Step 1: Prepare the uncorrected merged expression matrix
+# (Assumes 'merged_full' was created earlier and includes all datasets)
+# merged_full should be a matrix with genes as rows and samples as columns
+
+# Step 2: Transpose so samples are rows, genes are columns
+expr_precombat <- t(merged_full)
+
+# Step 3: Perform PCA
+pca_precombat <- prcomp(expr_precombat, scale. = TRUE, center = TRUE)
+
+# Step 4: Create a data frame for plotting
+pca_df_precombat <- data.frame(PC1 = pca_precombat$x[, 1],
+                               PC2 = pca_precombat$x[, 2],
+                               Dataset = full_batch_labels)  # Already matches column order of merged_full
+
+# Step 5: Plot the PCA
+ggplot(pca_df_precombat, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(title = "PCA of All Samples (Pre-ComBat)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set2")
+
+```
+
+```{r}
+# Transpose the corrected matrix so that rows = samples and columns = genes
+combat_pca_data <- t(combat_corrected_full)
+
+# Perform PCA on the transposed (sample-wise) matrix
+pca_result <- prcomp(combat_pca_data, scale. = TRUE, center = TRUE)
+
+# Build the PCA data frame
+pca_df <- data.frame(PC1 = pca_result$x[, 1],
+                     PC2 = pca_result$x[, 2],
+                     Dataset = full_batch_labels)  # Match original batch/dataset labels
+
+# Plot the PCA
+library(ggplot2)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(title = "PCA of All Samples (Post-ComBat)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set2") 
+
+```
+
+```{r}
+library(caret)
+library(randomForest)
+library(sva)  # for ComBat
+
+raw_expr_matrix <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40888_clean[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472[common_genes_all, ]
+)
+
+
+set.seed(3888)
+cv_folds <- createFolds(train_labels, k = 5, returnTrain = TRUE)
+cv_accuracies <- c()
+
+for (i in seq_along(cv_folds)) {
+  cat("Fold", i, "\n")
+  
+  # Split data
+  train_idx <- cv_folds[[i]]
+  test_idx  <- setdiff(seq_along(train_labels), train_idx)
+  
+  expr_train <- t(raw_expr_matrix[, train_idx])
+  expr_test  <- t(raw_expr_matrix[, test_idx])
+  
+  y_train <- train_labels[train_idx]
+  y_test  <- train_labels[test_idx]
+  
+  # Batch labels for ComBat (assumed known)
+  batch_train <- batch_labels[train_idx]
+  batch_test  <- batch_labels[test_idx]
+  
+  # Apply ComBat on training data only
+  combat_train <- ComBat(dat = t(expr_train), batch = batch_train, par.prior = TRUE)
+  
+  # Estimate ComBat params from training data
+  combat_model <- ComBat(dat = t(expr_train), batch = batch_train, mod = NULL, par.prior = TRUE, prior.plots = FALSE)
+  
+  # Apply the same parameters to test data
+  combat_test <- ComBat(dat = t(expr_test), batch = batch_test, mod = NULL, par.prior = TRUE, prior.plots = FALSE)
+  
+  # Transpose back for model
+  X_train <- t(combat_train)
+  X_test  <- t(combat_test)
+  
+  # Train model
+  rf_model <- randomForest(x = X_train, y = y_train, ntree = 500)
+  
+  # Predict
+  preds <- predict(rf_model, newdata = X_test)
+  
+  # Accuracy
+  acc <- mean(preds == y_test)
+  cv_accuracies[i] <- acc
+  cat("  Accuracy:", round(acc, 3), "\n")
+}
+
+cat("\nAverage 5-Fold CV Accuracy (no leakage):", round(mean(cv_accuracies), 3), "\n")
+```
+
+```{r}
+# Perform PCA on GSE67472 expression data (samples should be rows)
+expr_67472_t <- t(expr_matrix_67472)
+pca_67472 <- prcomp(expr_67472_t, center = TRUE, scale. = TRUE)
+
+# Option 1: Split based on PC1 threshold
+# Check distribution of PC1
+plot(pca_67472$x[,1], main = "PC1 values for GSE67472", ylab = "PC1", xlab = "Sample Index")
+
+# Method: split by sign of PC1 (or set a custom threshold if needed)
+split_labels <- ifelse(pca_67472$x[, 1] > 0, "GSE67472_batch1", "GSE67472_batch2")
+
+# Check distribution
+table(split_labels)
+
+# Create two separate expression matrices
+samples_batch1 <- rownames(pca_67472$x)[split_labels == "GSE67472_batch1"]
+samples_batch2 <- rownames(pca_67472$x)[split_labels == "GSE67472_batch2"]
+
+expr_matrix_67472_batch1 <- expr_matrix_67472[, samples_batch1]
+expr_matrix_67472_batch2 <- expr_matrix_67472[, samples_batch2]
+
+# Optional: verify
+dim(expr_matrix_67472_batch1)
+dim(expr_matrix_67472_batch2)
+
+```
+
+```{r}
+library(sva)
+library(ggplot2)
+
+# Step 1: Find common genes across ALL datasets
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40888_clean),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_40732),
+  rownames(expr_matrix_67472_batch1),
+  rownames(expr_matrix_67472_batch2)
+))
+
+# Step 2: Combine all datasets using only common genes
+merged_full <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40888_clean[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472_batch1[common_genes_all, ],
+  expr_matrix_67472_batch2[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ]
+)
+
+# Step 3: Create batch labels (must match column order)
+full_batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888", ncol(expr_matrix_40888_clean)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472_batch1", ncol(expr_matrix_67472_batch1)),
+  rep("GSE67472_batch2", ncol(expr_matrix_67472_batch2)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+
+# Step 4: Apply ComBat batch correction
+combat_corrected <- ComBat(dat = merged_full, batch = full_batch_labels, par.prior = TRUE)
+
+# Step 5: PCA on batch-corrected data (samples as rows)
+combat_pca_data <- t(combat_corrected)
+pca_res <- prcomp(combat_pca_data, scale. = TRUE, center = TRUE)
+
+# Step 6: Create PCA dataframe
+pca_df <- data.frame(PC1 = pca_res$x[,1],
+                     PC2 = pca_res$x[,2],
+                     Dataset = full_batch_labels)
+
+# Step 7: Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(title = "PCA of All Samples (Post-ComBat, GSE67472 split)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set2")
+
+```
+
+```{r}
+library(ggplot2)
+
+# Transpose expression matrix: samples as rows, genes as columns
+expr_40888_t <- t(expr_matrix_40888_clean)
+
+# Perform PCA
+pca_40888 <- prcomp(expr_40888_t, center = TRUE, scale. = TRUE)
+
+# Create PCA data frame
+pca_df_40888 <- data.frame(
+  PC1 = pca_40888$x[, 1],
+  PC2 = pca_40888$x[, 2],
+  Sample = rownames(pca_40888$x),
+  Label = ifelse(grepl("asthmatic", pheno_data_40888$`characteristics_ch1.3`, ignore.case = TRUE),
+                 "Asthma", "Control")
+)
+
+# Plot PCA
+ggplot(pca_df_40888, aes(x = PC1, y = PC2, color = Label)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA of GSE40888 Samples",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  scale_color_manual(values = c("Asthma" = "#d95f02", "Control" = "#1b9e77"))
+
+```
+
+```{r}
+library(ggplot2)
+library(sva)
+
+# Perform PCA again
+expr_40888_t <- t(expr_matrix_40888_clean)
+pca_40888 <- prcomp(expr_40888_t, center = TRUE, scale. = TRUE)
+
+# Plot PC1 to visually check gap if you want
+plot(pca_40888$x[,1], main = "PC1 values for GSE40888", ylab = "PC1", xlab = "Sample Index")
+
+# Split by PC1 (this seems to be your real separation axis)
+split_labels_40888 <- ifelse(pca_40888$x[,1] > 0, "GSE40888_batch1", "GSE40888_batch2")
+
+table(split_labels_40888)  # check counts
+
+# Create two matrices
+samples_batch1_40888 <- rownames(pca_40888$x)[split_labels_40888 == "GSE40888_batch1"]
+samples_batch2_40888 <- rownames(pca_40888$x)[split_labels_40888 == "GSE40888_batch2"]
+
+expr_matrix_40888_batch1 <- expr_matrix_40888_clean[, samples_batch1_40888]
+expr_matrix_40888_batch2 <- expr_matrix_40888_clean[, samples_batch2_40888]
+
+
+# ------------------------------
+# Now do PCA of all datasets incl. splits
+# ------------------------------
+
+# Step 4: Get common genes across ALL datasets including splits
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_40732),
+  rownames(expr_matrix_67472_batch1),
+  rownames(expr_matrix_67472_batch2),
+  rownames(expr_matrix_40888_batch1),
+  rownames(expr_matrix_40888_batch2)
+))
+
+# Step 5: Merge all datasets
+merged_full <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40888_batch1[common_genes_all, ],
+  expr_matrix_40888_batch2[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472_batch1[common_genes_all, ],
+  expr_matrix_67472_batch2[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ]
+)
+
+# Step 6: Create batch labels
+full_batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888_batch1", ncol(expr_matrix_40888_batch1)),
+  rep("GSE40888_batch2", ncol(expr_matrix_40888_batch2)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472_batch1", ncol(expr_matrix_67472_batch1)),
+  rep("GSE67472_batch2", ncol(expr_matrix_67472_batch2)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+
+# Step 7: Apply ComBat batch correction
+combat_corrected <- ComBat(dat = merged_full, batch = full_batch_labels, par.prior = TRUE)
+
+write.csv(combat_corrected, "expression_7datasets_postCombat.csv")
+
+# Step 8: PCA on batch-corrected data
+combat_pca_data <- t(combat_corrected)
+pca_res <- prcomp(combat_pca_data, scale. = TRUE, center = TRUE)
+
+saveRDS(combat_corrected, file = "frozen_combat_corrected_expr_primary_model.rds")
+
+# Step 9: Plot PCA
+pca_df <- data.frame(PC1 = pca_res$x[,1],
+                     PC2 = pca_res$x[,2],
+                     Dataset = full_batch_labels)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(title = "PCA of All Samples (Post-ComBat, GSE67472 + GSE40888 split)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set2")
+
+```
+
+```{r}
+library(caret)
+library(dplyr)
+library(ggplot2)
+
+# Example expression data
+# expr_matrix: samples x genes
+# labels: factor of class labels (same order as expr_matrix rows)
+
+# Replace these with your actual data
+# Example dummy data for illustration:
+set.seed(3888)
+n_samples <- 100
+n_genes <- 5  # adjust for Top2, Top5, Top8 etc.
+expr_matrix <- matrix(rnorm(n_samples * n_genes), ncol = n_genes)
+colnames(expr_matrix) <- paste0("Gene", 1:n_genes)
+labels <- factor(sample(c("Asthma", "Control"), n_samples, replace = TRUE))
+
+# Data frame for caret
+data_df <- as.data.frame(expr_matrix)
+data_df$Class <- labels
+
+# Define models to run
+model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")  # Random Forest, SVM, KNN, Naive Bayes, Decision Tree
+
+# Create trainControl object
+ctrl <- trainControl(method = "cv", number = 5, savePredictions = "final")
+
+# Store results
+results <- list()
+
+# Run models
+for (model_name in model_list) {
+  set.seed(3888)
+  cat("Training model:", model_name, "\n")
+  
+  fit <- train(Class ~ ., data = data_df,
+               method = model_name,
+               trControl = ctrl,
+               preProcess = c("center", "scale"))
+  
+  results[[model_name]] <- fit
+}
+
+```
+
+```{r}
+# Extract accuracy results
+accuracy_df <- bind_rows(lapply(names(results), function(name) {
+  fit <- results[[name]]
+  data.frame(
+    Model = name,
+    Accuracy = fit$resample$Accuracy
+  )
+}))
+
+# Optional: change model names to match your plot labels
+accuracy_df$Model <- factor(accuracy_df$Model, 
+                            levels = c("rf", "svmLinear", "knn", "nb", "rpart"),
+                            labels = c("RF", "SVM", "KNN", "NB", "DT"))
+
+head(accuracy_df)
+
+```
+
+```{r}
+ggplot(accuracy_df, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "white", outlier.color = "black", width = 0.6) +
+  scale_fill_manual(values = c("RF" = "red", "SVM" = "green", "KNN" = "blue", 
+                               "NB" = "purple", "DT" = "orange")) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Comparison of Model Accuracies",
+       y = "Cross-Validated Accuracy",
+       x = "Model") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0.4, 0.8))
+
+```
+
+```{r}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(limma)
+
+# ---- INPUT DATA: replace these with your real data ----
+# expr_matrix: genes x samples matrix
+# labels: factor of sample labels (same order as columns of expr_matrix)
+
+# Example mock data for testing (replace with yours!)
+set.seed(3888)
+expr_matrix <- matrix(rnorm(1000 * 80), nrow = 1000)  # 1000 genes x 80 samples
+rownames(expr_matrix) <- paste0("Gene", 1:1000)
+labels <- factor(rep(c("Asthma", "Control"), each = 40))
+
+# ---- FUNCTION to get top N DE genes ----
+get_top_genes <- function(expr_matrix, labels, top_n) {
+  design <- model.matrix(~labels)
+  fit <- lmFit(expr_matrix, design)
+  fit <- eBayes(fit)
+  topTableRes <- topTable(fit, number = top_n, sort.by = "P")
+  selected_genes <- rownames(topTableRes)
+  return(selected_genes)
+}
+
+# ---- RUN CLASSIFIERS FOR DIFFERENT TOP GENE SETS ----
+results_list <- list()
+top_gene_sets <- c(2, 5, 8)
+
+for (n_genes in top_gene_sets) {
+  cat("Running models for top", n_genes, "DE genes...\n")
+  
+  # Step 1: select top N genes
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  
+  # Step 2: prepare data (transpose to samples x genes)
+  data_df <- as.data.frame(t(expr_matrix[top_genes, ]))
+  data_df$Class <- labels
+  
+  # Step 3: set up trainControl
+  ctrl <- trainControl(method = "cv", number = 5, savePredictions = "final")
+  
+  # Step 4: run models
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"))
+    
+    # Store results
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = fit$resample$Accuracy,
+      TopGenes = paste0("Top", n_genes, " DE Genes")
+    )
+    
+    results_list[[length(results_list) + 1]] <- model_results
+  }
+}
+
+# ---- COMBINE RESULTS ----
+results_df <- bind_rows(results_list)
+
+# Clean up model names for plotting
+results_df$Model <- factor(results_df$Model, 
+                           levels = c("rf", "svmLinear", "knn", "nb", "rpart"),
+                           labels = c("RF", "SVM", "KNN", "NB", "DT"))
+
+# ---- PLOT ----
+ggplot(results_df, aes(x = Model, y = Accuracy, fill = TopGenes)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "white", outlier.color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Top2 DE Genes" = "red",
+                               "Top5 DE Genes" = "green",
+                               "Top8 DE Genes" = "blue")) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Comparison of Model Accuracies across Different Top DE Gene Sets",
+       y = "Cross-Validated Accuracy",
+       x = "Model") +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0.4, 0.8))
+
+```
+
+```{r}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(limma)
+
+
+
+# ---- SET YOUR ACTUAL DATA ----
+# Replace combat_train_t_aligned and train_labels with your objects
+expr_matrix <- t(combat_train_t_aligned)  # genes x samples (transpose!)
+labels <- train_labels                    # factor labels (same order as columns of expr_matrix)
+
+# ---- FUNCTION to get top N DE genes ----
+get_top_genes <- function(expr_matrix, labels, top_n) {
+  design <- model.matrix(~labels)
+  fit <- lmFit(expr_matrix, design)
+  fit <- eBayes(fit)
+  topTableRes <- topTable(fit, number = top_n, sort.by = "P")
+  selected_genes <- rownames(topTableRes)
+  return(selected_genes)
+}
+
+# ---- RUN CLASSIFIERS FOR DIFFERENT TOP GENE SETS ----
+results_list <- list()
+top_gene_sets <- c(2, 5, 8)
+
+for (n_genes in top_gene_sets) {
+  cat("Running models for top", n_genes, "DE genes...\n")
+  
+  # Step 1: select top N genes
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  
+  # Step 2: prepare data for caret (samples x genes)
+  data_df <- as.data.frame(t(expr_matrix[top_genes, ]))  # transpose back
+  data_df$Class <- labels
+  
+  # Step 3: set up trainControl
+  ctrl <- trainControl(method = "cv", number = 5, savePredictions = "final")
+  
+  # Step 4: run models
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"))
+    
+    # Store results
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = fit$resample$Accuracy,
+      TopGenes = paste0("Top", n_genes, " DE Genes")
+    )
+    
+    results_list[[length(results_list) + 1]] <- model_results
+  }
+}
+
+# ---- COMBINE RESULTS ----
+results_df <- bind_rows(results_list)
+
+# Clean up model names for plotting
+results_df$Model <- factor(results_df$Model, 
+                           levels = c("rf", "svmLinear", "knn", "nb", "rpart"),
+                           labels = c("RF", "SVM", "KNN", "NB", "DT"))
+
+# ---- PLOT ----
+ggplot(results_df, aes(x = Model, y = Accuracy, fill = TopGenes)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "white", outlier.color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Top2 DE Genes" = "red",
+                               "Top5 DE Genes" = "green",
+                               "Top8 DE Genes" = "blue")) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Comparison of Model Accuracies across Different Top DE Gene Sets",
+       y = "Cross-Validated Accuracy",
+       x = "Model") +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0.4, 0.8))
+
+```
+
+```{r}
+design <- model.matrix(~labels)
+fit <- lmFit(expr_matrix, design)
+fit <- eBayes(fit)
+top_20_table <- topTable(fit, number = 20, sort.by = "P")
+print(top_20_table)
+
+# Get the list of top 20 gene names
+top_20_genes <- rownames(top_20_table)
+
+# Save as .rds file
+saveRDS(top_20_genes, file = "top_20_genes.rds")
+```
+
+```{r}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(limma)
+
+# ---- Expression matrix and labels ----
+expr_matrix <- t(combat_train_t_aligned)  # genes x samples
+labels <- train_labels                    # factor vector
+
+# ---- Function to get top N DE genes ----
+get_top_genes <- function(expr_matrix, labels, top_n) {
+  design <- model.matrix(~labels)
+  fit <- lmFit(expr_matrix, design)
+  fit <- eBayes(fit)
+  topTableRes <- topTable(fit, number = top_n, sort.by = "P")
+  selected_genes <- rownames(topTableRes)
+  return(selected_genes)
+}
+
+# ---- Model training ----
+results_list <- list()
+top_gene_sets <- c(8, 10, 15, 20, 25)
+
+for (n_genes in top_gene_sets) {
+  cat("Running models for top", n_genes, "DE genes...\n")
+  
+  # Step 1: Get top genes
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  
+  # Step 2: Prepare data for caret
+  data_df <- as.data.frame(t(expr_matrix[top_genes, ]))  # samples x genes
+  data_df$Class <- labels
+  
+  # Step 3: Set up cross-validation
+  ctrl <- trainControl(method = "cv", number = 5, savePredictions = "final")
+  
+  # Step 4: Train RF and KNN only
+  for (model_name in c("rf", "knn")) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"))
+    
+    # Save the RF model with top 20 genes
+    if (n_genes == 20 && model_name == "rf") {
+      saveRDS(fit, file = "rf_model_top20_genes.rds")
+      cat("Saved RF model trained on top 20 DE genes to 'rf_model_top20_genes.rds'\n")
+    }
+    
+    # Store results
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = fit$resample$Accuracy,
+      TopGenes = paste0("Top", n_genes, " DE Genes")
+    )
+    
+    results_list[[length(results_list) + 1]] <- model_results
+  }
+}
+
+# ---- Combine and Plot ----
+results_df <- bind_rows(results_list)
+
+results_df$Model <- factor(results_df$Model,
+                           levels = c("rf", "knn"),
+                           labels = c("RF", "KNN"))
+
+ggplot(results_df, aes(x = Model, y = Accuracy, fill = TopGenes)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "white", outlier.color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Top8 DE Genes" = "blue",
+                               "Top10 DE Genes" = "purple",
+                               "Top15 DE Genes" = "orange",
+                               "Top20 DE Genes" = "darkgreen",
+                               "Top25 DE Genes" = "brown")) +
+  theme_minimal(base_size = 14) +
+  labs(title = "RF and KNN Accuracy with Increasing DE Gene Sets",
+       y = "Cross-Validated Accuracy",
+       x = "Model") +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0.4, 0.9))
+
+```
+
+```{r}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(limma)
+
+# ---- Expression matrix and labels ----
+expr_matrix <- t(combat_train_t_aligned)  # genes x samples
+labels <- train_labels                    # factor labels
+
+# ---- Function to get top N DE genes ----
+get_top_genes <- function(expr_matrix, labels, top_n) {
+  design <- model.matrix(~labels)
+  fit <- lmFit(expr_matrix, design)
+  fit <- eBayes(fit)
+  topTableRes <- topTable(fit, number = top_n, sort.by = "P")
+  selected_genes <- rownames(topTableRes)
+  return(selected_genes)
+}
+
+# ---- Run models for selected top gene counts ----
+results_list <- list()
+top_gene_sets <- c(10, 15, 20, 25)
+
+for (n_genes in top_gene_sets) {
+  cat("Running models for top", n_genes, "DE genes...\n")
+  
+  # Select top N DE genes
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  
+  # Prepare data
+  data_df <- as.data.frame(t(expr_matrix[top_genes, ]))
+  data_df$Class <- labels
+  
+  # Cross-validation setup
+  ctrl <- trainControl(method = "cv", number = 5, savePredictions = "final")
+  
+  # Models to train
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"))
+    
+    # Store results
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = fit$resample$Accuracy,
+      TopGenes = paste0("Top", n_genes, " DE Genes")
+    )
+    
+    results_list[[length(results_list) + 1]] <- model_results
+  }
+}
+
+# ---- Combine and Plot ----
+results_df <- bind_rows(results_list)
+
+# Clean up model names
+results_df$Model <- factor(results_df$Model,
+                           levels = c("rf", "svmLinear", "knn", "nb", "rpart"),
+                           labels = c("RF", "SVM", "KNN", "NB", "DT"))
+
+# Plotting
+ggplot(results_df, aes(x = Model, y = Accuracy, fill = TopGenes)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "white", outlier.color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Top10 DE Genes" = "purple",
+                               "Top15 DE Genes" = "orange",
+                               "Top20 DE Genes" = "darkgreen",
+                               "Top25 DE Genes" = "brown")) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Model Accuracy with Top 10–25 DE Genes",
+       y = "Cross-Validated Accuracy",
+       x = "Model") +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0.4, 0.9))
+
+```
+
+```{r}
+
+```
+
+```{r}
+library(caret)
+library(limma)
+library(dplyr)
+library(ggplot2)
+
+# These should be BEFORE you applied ComBat anywhere
+raw_67472 <- expr_matrix_67472
+raw_40888 <- expr_matrix_40888_clean
+
+
+# ---- STEP 1: Define all labels ----
+labels_64913 <- ifelse(grepl("Asthmatic", pheno_data_64913$characteristics_ch1.1, ignore.case = TRUE),
+                       "Asthma", "Control")
+
+labels_40888_all <- ifelse(grepl("asthmatic", pheno_data_40888$characteristics_ch1.3, ignore.case = TRUE),
+                           "Asthma", "Control")
+labels_40888 <- labels_40888_all
+names(labels_40888) <- rownames(pheno_data_40888)
+
+labels_143303 <- ifelse(pheno_data_gse143303$characteristics_ch1.1 == "disease status: Severe asthma",
+                        "Asthma", "Control")
+names(labels_143303) <- rownames(pheno_data_gse143303)
+
+labels_67472_all <- ifelse(grepl("asthma", pheno_data_67472$`disease state:ch1`, ignore.case = TRUE),
+                           "Asthma", "Control")
+labels_67472 <- labels_67472_all
+names(labels_67472) <- rownames(pheno_data_67472)
+
+labels_40732 <- ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), 
+                       "Asthma", "Control")
+names(labels_40732) <- rownames(pheno_data_40732)
+
+expr_matrix_64913_clean <- data.matrix(expr_matrix_64913_clean)
+expr_matrix_40888_batch1 <- data.matrix(expr_matrix_40888_batch1)
+expr_matrix_40888_batch2 <- data.matrix(expr_matrix_40888_batch2)
+expr_matrix_gse143303_cleaned <- data.matrix(expr_matrix_gse143303_cleaned)
+expr_matrix_67472_batch1 <- data.matrix(expr_matrix_67472_batch1)
+expr_matrix_67472_batch2 <- data.matrix(expr_matrix_67472_batch2)
+expr_matrix_40732 <- data.matrix(expr_matrix_40732)
+
+# ---- STEP 2: Combine datasets ----
+combat_train_t_aligned <- t(cbind(
+  expr_matrix_64913_clean[common_genes, ],
+  expr_matrix_40888_batch1[common_genes, ],
+  expr_matrix_40888_batch2[common_genes, ],
+  expr_matrix_gse143303_cleaned[common_genes, ],
+  expr_matrix_67472_batch1[common_genes, ],
+  expr_matrix_67472_batch2[common_genes, ],
+  expr_matrix_40732[common_genes, ]
+))
+
+# ---- STEP 3: Create batch labels ----
+full_batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888_batch1", ncol(expr_matrix_40888_batch1)),
+  rep("GSE40888_batch2", ncol(expr_matrix_40888_batch2)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472_batch1", ncol(expr_matrix_67472_batch1)),
+  rep("GSE67472_batch2", ncol(expr_matrix_67472_batch2)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+
+# ---- STEP 4: Create labels ----
+train_labels <- c(
+  labels_64913,
+  labels_40888[colnames(expr_matrix_40888_batch1)],
+  labels_40888[colnames(expr_matrix_40888_batch2)],
+  labels_143303,
+  labels_67472[colnames(expr_matrix_67472_batch1)],
+  labels_67472[colnames(expr_matrix_67472_batch2)],
+  labels_40732
+)
+
+# ---- STEP 5: Expression matrix ----
+expr_matrix <- combat_train_t_aligned
+labels <- train_labels
+groups <- full_batch_labels
+
+# ---- STEP 6: DE gene selection ----
+get_top_genes <- function(expr_matrix, labels, top_n) {
+  expr_matrix <- data.matrix(expr_matrix)         # 🚨 guarantees numeric matrix
+  design <- model.matrix(~labels)
+  fit <- lmFit(t(expr_matrix), design)
+  fit <- eBayes(fit)
+  topTableRes <- topTable(fit, number = top_n, sort.by = "P")
+  rownames(topTableRes)
+}
+
+
+# ---- STEP 7: 7-FOLD dataset CV ----
+results_list <- list()
+top_gene_sets <- c(2, 5, 8)
+folds <- groupKFold(groups, k = length(unique(groups)))
+
+for (n_genes in top_gene_sets) {
+  cat("Running models for top", n_genes, "genes...\n")
+  
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  data_df <- as.data.frame(expr_matrix[, top_genes])
+  data_df$Class <- labels
+  
+  ctrl <- trainControl(index = folds,
+                       savePredictions = "final")
+  
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"))
+    
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = fit$resample$Accuracy,
+      TopGenes = paste0("Top", n_genes)
+    )
+    results_list[[length(results_list) + 1]] <- model_results
+  }
+}
+
+# ---- STEP 8: Plot results ----
+results_df <- bind_rows(results_list)
+
+results_df$Model <- factor(results_df$Model,
+                           levels = c("rf", "svmLinear", "knn", "nb", "rpart"),
+                           labels = c("RF", "SVM", "KNN", "NB", "DT"))
+
+ggplot(results_df, aes(x = Model, y = Accuracy, fill = TopGenes)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "white", outlier.color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(title = "7 Dataset Leave-One-Dataset-Out CV Accuracy",
+       y = "Accuracy", x = "Model") +
+  scale_fill_manual(values = c("Top2" = "red", "Top5" = "green", "Top8" = "blue")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+library(pROC)
+
+# ---- EXTRACT ROC CURVES FROM EXISTING MODELS ----
+# We assume you have kept your trained models in 'results'
+
+# (OPTIONAL) If you want to reuse 'results_list' from your training code:
+# You would have to also save the model fits.
+# Your current code only stores accuracies, not the full models.
+
+# BUT if you had something like this in training:
+# results_models[[paste0("Top", n_genes, "_", model_name)]] <- fit
+# Then you could use that.
+
+# So here's an example assuming you saved full models like this:
+# (This would be your additional training block modification)
+
+results_models <- list()
+
+for (n_genes in top_gene_sets) {
+  cat("Running models for ROC extraction for top", n_genes, "DE genes...\n")
+  
+  # Select top N genes
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  
+  # Prepare data
+  data_df <- as.data.frame(t(expr_matrix[top_genes, ]))
+  data_df$Class <- labels
+  
+  # TrainControl for ROC
+  ctrl <- trainControl(method = "cv", number = 5,
+                       classProbs = TRUE, 
+                       summaryFunction = twoClassSummary,
+                       savePredictions = "final")
+  
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"),
+                 metric = "ROC")
+    
+    # Save full model
+    results_models[[paste0("Top", n_genes, "_", model_name)]] <- fit
+  }
+}
+
+# ---- NOW EXTRACT ROC CURVES ----
+
+roc_list <- list()
+
+for (name in names(results_models)) {
+  fit <- results_models[[name]]
+  preds <- fit$pred
+  
+  # Sometimes multiple resamples: choose best tuning parameter if needed
+  if ("mtry" %in% names(preds)) {
+    best_mtry <- fit$bestTune$mtry
+    preds <- preds[preds$mtry == best_mtry, ]
+  }
+  if ("C" %in% names(preds)) { # for SVM
+    best_C <- fit$bestTune$C
+    preds <- preds[preds$C == best_C, ]
+  }
+  if ("k" %in% names(preds)) { # for kNN
+    best_k <- fit$bestTune$k
+    preds <- preds[preds$k == best_k, ]
+  }
+  
+  # Compute ROC
+  roc_obj <- roc(preds$obs, preds$Asthma, levels = c("Control", "Asthma"))
+  roc_list[[name]] <- roc_obj
+}
+
+# ---- PLOT ROC CURVES ----
+ggroc(roc_list, legacy.axes = TRUE) +
+  ggtitle("ROC Curves for All Models (5-Fold CV)") +
+  theme_minimal() +
+  labs(x = "False Positive Rate", y = "True Positive Rate")
+
+
+```
+
+```{r}
+rf_fit <- readRDS("rf_model_top20_genes.rds")
+
+# Extract predictions from cross-validation
+preds <- rf_fit$pred
+
+# If tuning (e.g., mtry) was used, select predictions from the best hyperparameter
+if ("mtry" %in% names(preds)) {
+  preds <- preds[preds$mtry == rf_fit$bestTune$mtry, ]
+}
+
+```
+
+```{r}
+library(caret)
+
+# Create confusion matrix
+conf_mat <- confusionMatrix(preds$pred, preds$obs, positive = "Asthma")
+print(conf_mat)
+
+```
+
+```{r}
+library(pROC)
+
+# Use predicted probabilities for ROC
+roc_obj <- roc(preds$obs, preds$Asthma, levels = c("Control", "Asthma"))
+
+# Plot ROC curve
+plot(roc_obj, col = "blue", lwd = 2, main = "ROC Curve for RF (Top 20 DE Genes)")
+auc_val <- auc(roc_obj)
+cat("AUC:", round(auc_val, 3), "\n")
+
+```
+
+# Model 2
+NOTE THAT THIS IS WHAT THE RIGHT EXPR MATRIXES ARE CALLED
+datasets <- list(
+  GSE40732 = expr_matrix_40732,
+  GSE67472 = expr_matrix_67472,
+  GSE143303 = expr_matrix_gse143303_cleaned,
+  GSE40888 = expr_matrix_40888_clean,
+  GSE64913 = expr_matrix_64913_clean
+)
+
+```{r}
+length(common_genes_all)
+```
+
+
+```{r}
+BiocManager::install("sva")
+```
+
+
+```{r}
+# Load required packages
+library(sva)
+library(limma)
+library(caret)
+
+# ---- 1. Create Labels ----
+# Dataset: GSE40732
+labels_40732 <- ifelse(grepl("subtype: non", pheno_data_40732$characteristics_ch1.1), "healthy",
+                 ifelse(grepl("subtype: reversible|subtype: PC20", pheno_data_40732$characteristics_ch1.1), "moderate", "severe"))
+
+# Dataset: GSE67472
+labels_67472 <- ifelse(pheno_data_67472$`disease state:ch1` == "asthma", "moderate", "healthy")
+
+# Dataset: GSE143303
+labels_143303 <- ifelse(grepl("Severe asthma", pheno_data_143303$characteristics_ch1.1), "severe", "healthy")
+
+# Dataset: GSE64913
+labels_64913 <- ifelse(grepl("Severe Asthmatic", pheno_data_64913$characteristics_ch1.1), "severe", "healthy")
+
+# ---- 2. Combine Expression and Labels ----
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40732),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472)
+))
+
+# Expression matrix
+raw_expr_matrix <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472[common_genes_all, ]
+)
+
+# Labels
+combined_labels <- c(labels_64913, labels_40732, labels_143303, labels_67472)
+```
+
+```{r}
+pca_67472 <- prcomp(t(expr_matrix_67472[common_genes_all, ]), scale. = TRUE)
+pc1_67472 <- pca_67472$x[, 1]
+
+# Sub-batch labels
+sub_batch_67472 <- ifelse(pc1_67472 >= 0, "batch1_67472", "batch2_67472")
+```
+
+
+```{r}
+# Batch labels
+batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40732", ncol(expr_matrix_40732)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  sub_batch_67472
+)
+
+# ---- 3. Apply ComBat with Mod Matrix ----
+mod <- model.matrix(~ combined_labels)
+combat_corrected_expr <- ComBat(dat = raw_expr_matrix, batch = batch_labels, mod = mod, par.prior = TRUE)
+
+# ---- 4. Drop Healthy Samples ----
+non_healthy_idx <- which(combined_labels != "healthy")
+expr_non_healthy <- combat_corrected_expr[, non_healthy_idx]
+labels_non_healthy <- combined_labels[non_healthy_idx]
+
+# ---- 5. Differential Expression (Moderate vs Severe) ----
+design <- model.matrix(~ 0 + factor(labels_non_healthy))
+colnames(design) <- levels(factor(labels_non_healthy))
+fit <- lmFit(expr_non_healthy, design)
+contrast_matrix <- makeContrasts(severe - moderate, levels=design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+top_genes_df <- topTable(fit2, adjust="fdr", number=Inf)
+```
+
+```{r}
+# pca on unmerged data (coloured by condition)
+pca_unmerged <- prcomp(t(raw_expr_matrix), scale. = TRUE)
+pca_df_unmerged <- data.frame(
+  PC1 = pca_unmerged$x[,1],
+  PC2 = pca_unmerged$x[,2],
+  Condition = combined_labels
+)
+
+ggplot(pca_df_unmerged, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 2, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA of Unmerged Data", x = "PC1", y = "PC2")
+```
+```{r}
+# PCA on combat merged data (batch corrected)
+pca_combat <- prcomp(t(combat_corrected_expr), scale. = TRUE)
+pca_df_combat <- data.frame(
+  PC1 = pca_combat$x[,1],
+  PC2 = pca_combat$x[,2],
+  Condition = combined_labels,
+  Batch = batch_labels
+)
+
+# Plot 2: PCA of corrected data, colored by condition
+ggplot(pca_df_combat, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 2, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA of ComBat-Corrected Data (by Condition)", x = "PC1", y = "PC2")
+
+```
+
+```{r}
+# PCA of merged data, coloured by batch
+ggplot(pca_df_combat, aes(x = PC1, y = PC2, color = Batch)) +
+  geom_point(size = 2, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA of ComBat-Corrected Data (by Dataset)", x = "PC1", y = "PC2")
+
+```
+
+4 types of models (performance based on accuracy)
+```{r}
+set.seed(123)
+
+# Store results
+all_results <- data.frame()
+
+# List of top N genes
+for (n in c(2, 5, 10, 20)) {
+  top_genes <- rownames(top_genes_df)[1:n]
+  expr_subset <- t(expr_non_healthy[top_genes, ])
+  
+  df <- data.frame(expr_subset, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+  
+  # Set up CV
+  ctrl <- trainControl(method = "cv", number = 5, savePredictions = TRUE)
+  
+  # Models to train
+  models <- c("glm", "svmRadial", "rf", "knn")
+  
+  for (model in models) {
+    fit <- train(label ~ ., data = df, method = model, trControl = ctrl)
+    
+    # Extract accuracy for each fold
+    accs <- fit$resample$Accuracy
+    
+    # Store results in long format
+    all_results <- rbind(all_results, data.frame(
+      Accuracy = accs,
+      Model = model,
+      TopGenes = paste0("Top_", n)
+    ))
+  }
+}
+
+```
+
+```{r}
+all_results <- all_results %>%
+  mutate(
+    GeneModel = paste(TopGenes, Model, sep = "_"),
+    Model = factor(Model, levels = c("glm", "knn", "rf", "svmRadial")),
+    TopGenes = factor(TopGenes, levels = c("Top_2", "Top_5", "Top_10", "Top_20"))
+  )
+
+simplified_labels <- rep(c("GLM", "KNN", "RF", "SVM"), times = length(levels(all_results$TopGenes)))
+
+
+# Order the new x-axis factor so the gene sets are grouped, and within them, model order is preserved
+gene_model_levels <- c()
+for (g in levels(all_results$TopGenes)) {
+  for (m in levels(all_results$Model)) {
+    gene_model_levels <- c(gene_model_levels, paste(g, m, sep = "_"))
+  }
+}
+all_results$GeneModel <- factor(all_results$GeneModel, levels = gene_model_levels)
+
+# Step 2: Plot with x = GeneModel
+ggplot(all_results, aes(x = GeneModel, y = Accuracy, color = TopGenes)) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  geom_point(size = 2, alpha = 0.8, position = position_jitter(width = 0.15, height = 0)) +
+  scale_x_discrete(labels = simplified_labels) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Secondary Model Accuracy for Top 2-20 DE Genes",
+    x = "Model",
+    y = "Accuracy",
+    color = "Gene Set"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+4 model types (performance based on precision)
+
+```{r}
+install.packages("yardstick")
+```
+
+
+```{r}
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(yardstick)
+
+set.seed(123)
+
+# Custom summary function to compute precision
+precision_summary <- function(data, lev = NULL, model = NULL) {
+  precision_val <- precision_vec(truth = data$obs, estimate = data$pred, event_level = "second")
+  out <- c(Precision = precision_val)
+  return(out)
+}
+
+# Store results
+all_results <- data.frame()
+
+# List of top N genes
+for (n in c(2, 5, 10, 20)) {
+  top_genes <- rownames(top_genes_df)[1:n]
+  expr_subset <- t(expr_non_healthy[top_genes, ])
+  
+  df <- data.frame(expr_subset, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+  
+  # CV with precision as metric
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    savePredictions = TRUE,
+    classProbs = FALSE,
+    summaryFunction = precision_summary
+  )
+  
+  models <- c("glm", "svmRadial", "rf", "knn")
+  
+  for (model in models) {
+    fit <- train(label ~ ., data = df, method = model, metric = "Precision", trControl = ctrl)
+    
+    # Extract precision values
+    precisions <- fit$resample$Precision
+    
+    # Store results
+    all_results <- rbind(all_results, data.frame(
+      Precision = precisions,
+      Model = model,
+      TopGenes = paste0("Top_", n)
+    ))
+  }
+}
+
+# Organize labels and factors for plotting
+all_results <- all_results %>%
+  mutate(
+    GeneModel = paste(TopGenes, Model, sep = "_"),
+    Model = factor(Model, levels = c("glm", "knn", "rf", "svmRadial")),
+    TopGenes = factor(TopGenes, levels = c("Top_2", "Top_5", "Top_10", "Top_20"))
+  )
+
+# Simplified model labels (repeated pattern)
+simplified_labels <- rep(c("GLM", "KNN", "RF", "SVM"), times = length(levels(all_results$TopGenes)))
+
+# Preserve grouping and order for x-axis
+gene_model_levels <- c()
+for (g in levels(all_results$TopGenes)) {
+  for (m in levels(all_results$Model)) {
+    gene_model_levels <- c(gene_model_levels, paste(g, m, sep = "_"))
+  }
+}
+all_results$GeneModel <- factor(all_results$GeneModel, levels = gene_model_levels)
+
+# Precision plot
+ggplot(all_results, aes(x = GeneModel, y = Precision, color = TopGenes)) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  geom_point(size = 2, alpha = 0.8, position = position_jitter(width = 0.15, height = 0)) +
+  scale_x_discrete(labels = simplified_labels) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Secondary Model Precision with Top 2-100 DE Genes",
+    x = "Model",
+    y = "Precision",
+    color = "Gene Set"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+## 1-step model comparison
+
+```{r}
+set.seed(123)
+
+# Custom summary function to return both Accuracy and macro-averaged Precision
+multi_class_metrics <- function(data, lev = NULL, model = NULL) {
+  acc <- yardstick::accuracy_vec(data$obs, data$pred)
+  
+  # Average precision across all classes (macro average)
+  precision_per_class <- data %>%
+    yardstick::precision(truth = obs, estimate = pred) %>%
+    dplyr::pull(.estimate)
+  
+  macro_precision <- mean(precision_per_class)
+  
+  c(Accuracy = acc, Precision = macro_precision)
+}
+
+# Storage
+all_results_1step <- data.frame()
+
+# Top 5 genes
+top_genes_5 <- rownames(top_genes_df)[1:5]
+expr_subset_1step <- t(combat_corrected_expr[top_genes_5, ])
+df_1step <- data.frame(expr_subset_1step, label = factor(combined_labels, levels = c("healthy", "moderate", "severe")))
+
+# Cross-validation
+ctrl_1step <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = FALSE,
+  summaryFunction = multi_class_metrics
+)
+
+models <- c("svmRadial", "rf", "knn")
+
+# Train models and collect metrics
+for (model in models) {
+  fit <- train(label ~ ., data = df_1step, method = model, metric = "Accuracy", trControl = ctrl_1step)
+  
+  accs <- fit$resample$Accuracy
+  precs <- fit$resample$Precision
+  
+  all_results_1step <- rbind(all_results_1step, data.frame(
+    Accuracy = accs,
+    Precision = precs,
+    Model = model
+  ))
+}
+
+```
+
+```{r}
+# Boxplot to compare the accuracy of different models
+ggplot(all_results_1step, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Model Accuracy Comparison (5-Fold CV)",
+    x = "Model Type",
+    y = "Accuracy (5-fold CV)"
+  ) +
+  scale_fill_manual(values = c("svmRadial" = "lightblue", "rf" = "lightgreen", "knn" = "lightcoral")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+ggplot(all_results_1step, aes(x = Model, y = Precision, fill = Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Model Precision Comparison (Macro Avg, 5-Fold CV)",
+    x = "Model Type",
+    y = "Macro-Averaged Precision"
+  ) +
+  scale_fill_manual(values = c("svmRadial" = "lightblue", "rf" = "lightgreen", "knn" = "lightcoral")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+```{r}
+all_results_1step %>%
+  group_by(Model) %>%
+  summarise(
+    MeanAccuracy = mean(Accuracy),
+    MeanPrecision = mean(Precision)
+  ) %>%
+  arrange(desc(MeanPrecision))
+
+```
+
+
+## 2-step model comparative accuracy
+
+```{r}
+# Set the labels for binary classification: "asthma" vs "healthy"
+binary_labels <- ifelse(combined_labels != "healthy", "asthma", "healthy")
+
+# Subset the expression data for the top 10 genes
+top_genes_10 <- rownames(top_genes_df)[1:10]
+expr_subset_10 <- t(combat_corrected_expr[top_genes_10, ])
+
+# Create a data frame with the expression data and binary labels
+df_binary_2step <- data.frame(expr_subset_10, label = factor(binary_labels, levels = c("healthy", "asthma")))
+```
+
+```{r}
+# Set up cross-validation (5-fold CV)
+ctrl_binary <- trainControl(method = "cv", number = 5, savePredictions = TRUE)
+
+# Train the logistic regression model
+logit_model <- train(label ~ ., data = df_binary_2step, method = "svmRadial", trControl = ctrl_binary)
+
+# Print the model results
+cat("Logistic Regression Model Accuracy (Asthma vs Healthy): ", logit_model$results$Accuracy, "\n")
+```
+
+```{r}
+# --- STEP 1: Get top genes and prepare data for step 1 (healthy vs asthma) ---
+top_genes_step1 <- rownames(top_genes_df)[1:20]
+expr_step1 <- t(combat_corrected_expr[top_genes_step1, ])
+binary_labels <- ifelse(combined_labels == "healthy", "healthy", "asthma")
+df_step1 <- data.frame(expr_step1, label = factor(binary_labels, levels = c("healthy", "asthma")))
+
+# Train final Step 1 model: RF
+set.seed(123)
+step1_model <- train(
+  label ~ ., data = df_step1,
+  method = "rf",
+  trControl = trainControl(method = "none")  # train on full data
+)
+
+# --- STEP 2: Get top genes and prepare data for step 2 (moderate vs severe) ---
+top_genes_step2 <- rownames(top_genes_df)[1:5]  # top 5 DE genes for moderate vs severe
+expr_step2 <- t(expr_non_healthy[top_genes_step2, ])
+df_step2 <- data.frame(expr_step2, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+
+# Train final Step 2 model: kNN
+set.seed(123)
+step2_model <- train(
+  label ~ ., data = df_step2,
+  method = "knn",
+  trControl = trainControl(method = "none")
+)
+
+# --- STEP 3: Make predictions ---
+# Predict Step 1 (asthma vs healthy)
+pred_step1 <- predict(step1_model, newdata = df_step1)
+
+# Prepare Step 2 data: only predict moderate/severe if Step 1 says "asthma"
+step2_input <- combat_corrected_expr[top_genes_step2, pred_step1 == "asthma", drop = FALSE]
+step2_input <- t(step2_input)
+step2_input_df <- data.frame(step2_input)
+
+# Predict Step 2 (moderate vs severe)
+pred_step2 <- predict(step2_model, newdata = step2_input_df)
+
+# --- STEP 4: Combine Step 1 and Step 2 predictions ---
+# Construct final prediction: if step 1 == healthy, predict "healthy", otherwise use step 2
+final_preds <- rep(NA, length(pred_step1))
+final_preds[pred_step1 == "healthy"] <- "healthy"
+final_preds[pred_step1 == "asthma"] <- as.character(pred_step2)
+
+# --- STEP 5: Compare to true labels ---
+# True labels are in combined_labels
+final_preds <- factor(final_preds, levels = c("healthy", "moderate", "severe"))
+true_labels <- factor(combined_labels, levels = c("healthy", "moderate", "severe"))
+
+# Compute overall accuracy
+overall_accuracy <- mean(final_preds == true_labels)
+cat("Overall 2-Step Model Accuracy:", overall_accuracy, "\n")
+
+# Optional: confusion matrix
+confusionMatrix(final_preds, true_labels)
+
+```
+
+```{r}
+library(caret)
+library(dplyr)
+
+set.seed(123)
+num_splits <- 5
+accuracies <- numeric(num_splits)
+
+# Prepare true class labels
+true_labels_all <- factor(combined_labels, levels = c("healthy", "moderate", "severe"))
+
+# Create binary asthma/healthy labels for step 1
+binary_labels_all <- ifelse(combined_labels == "healthy", "healthy", "asthma")
+
+# Loop through 5 random splits
+for (i in 1:num_splits) {
+  cat("Running split", i, "...\n")
+  
+  # Create train/test indices
+  train_idx <- createDataPartition(true_labels_all, p = 0.8, list = FALSE)
+  test_idx <- setdiff(seq_along(true_labels_all), train_idx)
+  
+  # --- STEP 1: Train RF model for asthma vs healthy ---
+  expr_step1_train <- t(combat_corrected_expr[top_genes_step1, train_idx])
+  df_step1_train <- data.frame(expr_step1_train,
+                               label = factor(binary_labels_all[train_idx], levels = c("healthy", "asthma")))
+  
+  step1_model <- train(
+    label ~ ., data = df_step1_train,
+    method = "rf",
+    trControl = trainControl(method = "none")
+  )
+  
+  # --- STEP 2: Train kNN model for moderate vs severe ---
+  # Only train on non-healthy samples in the training set
+  non_healthy_train_idx <- train_idx[which(combined_labels[train_idx] != "healthy")]
+  expr_step2_train <- t(combat_corrected_expr[top_genes_step2, non_healthy_train_idx])
+  df_step2_train <- data.frame(expr_step2_train,
+                               label = factor(combined_labels[non_healthy_train_idx],
+                                              levels = c("moderate", "severe")))
+  
+  step2_model <- train(
+    label ~ ., data = df_step2_train,
+    method = "knn",
+    trControl = trainControl(method = "none")
+  )
+  
+  # --- STEP 3: Apply to test data ---
+  # Step 1 prediction
+  expr_step1_test <- t(combat_corrected_expr[top_genes_step1, test_idx])
+  df_step1_test <- data.frame(expr_step1_test)
+  pred_step1 <- predict(step1_model, newdata = df_step1_test)
+  
+  # Step 2: Only apply to test samples predicted as asthma
+  asthma_test_idx <- test_idx[which(pred_step1 == "asthma")]
+  
+  if (length(asthma_test_idx) > 0) {
+    expr_step2_test <- t(combat_corrected_expr[top_genes_step2, asthma_test_idx])
+    df_step2_test <- data.frame(expr_step2_test)
+    pred_step2 <- predict(step2_model, newdata = df_step2_test)
+  } else {
+    pred_step2 <- character(0)
+  }
+  
+  # --- STEP 4: Final combined prediction ---
+  final_preds <- character(length(test_idx))
+  final_preds[pred_step1 == "healthy"] <- "healthy"
+  final_preds[pred_step1 == "asthma"] <- as.character(pred_step2)
+  
+  # Final true labels
+  true_test_labels <- combined_labels[test_idx]
+  
+  # --- STEP 5: Accuracy ---
+  final_preds <- factor(final_preds, levels = c("healthy", "moderate", "severe"))
+  true_test_labels <- factor(true_test_labels, levels = c("healthy", "moderate", "severe"))
+  
+  acc <- mean(final_preds == true_test_labels)
+  accuracies[i] <- acc
+}
+
+# Final output
+cat("Average Overall 2-Step Model Accuracy across", num_splits, "splits:", round(mean(accuracies), 4), "\n")
+
+```
+```{r}
+set.seed(2)
+num_splits <- 5
+accuracies <- numeric(num_splits)
+precisions <- numeric(num_splits)
+
+# Prepare full labels
+true_labels_all <- factor(combined_labels, levels = c("healthy", "moderate", "severe"))
+binary_labels_all <- ifelse(combined_labels == "healthy", "healthy", "asthma")
+
+for (i in 1:num_splits) {
+  cat("Running split", i, "...\n")
+  
+  # Split
+  train_idx <- createDataPartition(true_labels_all, p = 0.8, list = FALSE)
+  test_idx <- setdiff(seq_along(true_labels_all), train_idx)
+  
+  # --- STEP 1: Train RF model (healthy vs asthma) ---
+  expr_step1_train <- t(combat_corrected_expr[top_genes_step1, train_idx])
+  df_step1_train <- data.frame(expr_step1_train,
+                               label = factor(binary_labels_all[train_idx], levels = c("healthy", "asthma")))
+  
+  step1_model <- train(label ~ ., data = df_step1_train, method = "rf",
+                       trControl = trainControl(method = "none"))
+  
+  # --- STEP 2: Train kNN model (moderate vs severe) ---
+  non_healthy_train_idx <- train_idx[which(combined_labels[train_idx] != "healthy")]
+  expr_step2_train <- t(combat_corrected_expr[top_genes_step2, non_healthy_train_idx])
+  df_step2_train <- data.frame(expr_step2_train,
+                               label = factor(combined_labels[non_healthy_train_idx],
+                                              levels = c("moderate", "severe")))
+  
+  step2_model <- train(label ~ ., data = df_step2_train, method = "knn",
+                       trControl = trainControl(method = "none"))
+  
+  # --- STEP 3: Predict on test set ---
+  expr_step1_test <- t(combat_corrected_expr[top_genes_step1, test_idx])
+  df_step1_test <- data.frame(expr_step1_test)
+  pred_step1 <- predict(step1_model, newdata = df_step1_test)
+  
+  asthma_test_idx <- test_idx[which(pred_step1 == "asthma")]
+  if (length(asthma_test_idx) > 0) {
+    expr_step2_test <- t(combat_corrected_expr[top_genes_step2, asthma_test_idx])
+    df_step2_test <- data.frame(expr_step2_test)
+    pred_step2 <- predict(step2_model, newdata = df_step2_test)
+  } else {
+    pred_step2 <- character(0)
+  }
+  
+  # --- STEP 4: Final prediction ---
+  final_preds <- character(length(test_idx))
+  final_preds[pred_step1 == "healthy"] <- "healthy"
+  final_preds[pred_step1 == "asthma"] <- as.character(pred_step2)
+  
+  true_test_labels <- combined_labels[test_idx]
+  
+  # Format factors
+  final_preds <- factor(final_preds, levels = c("healthy", "moderate", "severe"))
+  true_test_labels <- factor(true_test_labels, levels = c("healthy", "moderate", "severe"))
+  
+  # --- STEP 5: Accuracy and Precision ---
+  acc <- mean(final_preds == true_test_labels)
+  accuracies[i] <- acc
+  
+  # Use yardstick for macro-averaged precision
+  prec_tbl <- data.frame(truth = true_test_labels, prediction = final_preds)
+  prec_result <- yardstick::precision(prec_tbl, truth = truth, estimate = prediction, estimator = "macro")
+  precisions[i] <- prec_result$.estimate
+}
+
+# --- FINAL RESULTS ---
+cat("Average 2-Step Model Accuracy over", num_splits, "splits:", round(mean(accuracies), 4), "\n")
+cat("Average Macro-Averaged Precision over", num_splits, "splits:", round(mean(precisions), 4), "\n")
+
+```
+
+
+
+## Final kNN Secondary Model and RDS for Shiny
+
+```{r}
+set.seed(123)
+
+# Select top 5 genes
+top5_genes <- rownames(top_genes_df)[1:5]
+expr_top5 <- t(expr_non_healthy[top5_genes, ])
+
+df_final <- data.frame(expr_top5, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+
+final_knn_model <- train(
+  label ~ .,
+  data = df_final,
+  method = "knn",
+  trControl = trainControl(method = "none")
+)
+```
+
+RDS stuff
+
+```{r}
+saveRDS(combat_corrected_expr, file = "frozen_combat_corrected_expr_secondary_model.rds")
+
+# --- 2. Save list of top DE genes for both steps ---
+top_genes_secondary <- rownames(top_genes_df)[1:5] 
+top_genes_secondary
+
+saveRDS(top_genes_secondary, file = "top_de_genes_list_secondary.rds")
+
+# --- 3. Save final kNN model for moderate vs severe ---
+saveRDS(final_knn_model, file = "final_secondary_model.rds")
+
+# Add gene names as a column
+
+
+
+```
+
+```{r}
+combat_expr_export <- data.frame(Gene = rownames(expr_non_healthy), expr_non_healthy)
+write.csv(combat_expr_export, file = "combat_combined_expression_matrix_secondary_model.csv", row.names = FALSE)
+
+```
+
+```{r}
+expr_non_healthy_raw <- raw_expr_matrix[, non_healthy_idx]
+
+raw_expr_export <- data.frame(Gene = rownames(expr_non_healthy_raw), expr_non_healthy_raw)
+write.csv(raw_expr_export, file = "raw_combined_expression_matrix_secondary_model.csv", row.names = FALSE)
+```
+
+
+
+
+
+

@@ -1,0 +1,264 @@
+---
+title: "EDA-Assignment-2"
+output: html_document
+date: "2025-04-03"
+---
+
+```{r}
+library(tidyverse)
+library(limma)
+library(edgeR)
+library(GEOquery)
+library(affy) 
+library(data.table)
+library(pheatmap)
+library(R.utils)
+library(ggplot2)
+library(caret)         
+library(glmnet)       
+library(randomForest) 
+library(e1071)         
+library(class)        
+library(pROC)
+```
+
+```{r}
+#raw_dir <- "GSE40732_RAW"
+
+#file_path <- "GSE40732_RAW/GSM999867_534619A04_532_norm_RMA.pair.gz"
+
+#peek <- fread(file_path, nrows = 10)
+#print(peek)
+```
+
+```{r}
+# Path to your data
+raw_dir <- "GSE40732_RAW"
+
+# List all normalized .pair.gz files
+norm_files <- list.files(raw_dir, pattern = "_norm_RMA.pair.gz$", full.names = TRUE)
+
+# Helper: Read probe intensities from one file
+read_pair_file <- function(file) {
+  dt <- fread(file)
+  dt[, .(PROBE_ID, PM)]
+}
+
+# Extract probe IDs from the first file
+probe_ids <- fread(norm_files[1])$PROBE_ID
+
+# Create expression matrix
+expr_matrix <- sapply(norm_files, function(file) {
+  fread(file)[["PM"]]
+})
+
+# Assign row and column names
+rownames(expr_matrix) <- probe_ids
+colnames(expr_matrix) <- gsub("_.*", "", basename(norm_files))  # Sample names
+```
+
+```{r}
+# Transpose and run PCA
+pca <- prcomp(t(expr_matrix), scale. = TRUE)
+
+# Basic PCA plot
+pca_df <- as.data.frame(pca$x)
+ggplot(pca_df, aes(PC1, PC2)) +
+  geom_point() +
+  labs(title = "PCA of Samples", x = "PC1", y = "PC2")
+```
+
+The closer two dots, are, the most similar expression profiles they have. The farther apart the dots are, the more different they are.
+
+```{r}
+# Reinstall GEOquery
+BiocManager::install("GEOquery", force = TRUE)
+```
+
+```{r}
+# Load metadata from GEO
+gse <- getGEO("GSE40732", GSEMatrix = TRUE)
+metadata <- pData(gse[[1]])
+colnames(metadata)
+
+# Extract "asthmatic" / "control" label (adjust index if needed)
+metadata$condition <- gsub(".*: ", "", metadata$characteristics_ch1)
+
+
+# Match metadata to expression matrix columns
+metadata <- metadata[match(colnames(expr_matrix), rownames(metadata)), ]
+
+# Make sure metadata and expression matrix match
+annotation_col <- data.frame(Condition = metadata$condition)
+rownames(annotation_col) <- colnames(expr_matrix)
+
+# Pick top 50 most variable genes
+top_genes <- apply(expr_matrix, 1, var) %>% sort(decreasing = TRUE) %>% head(50) %>% names()
+
+# Create heatmap
+pheatmap(expr_matrix[top_genes, ],
+         scale = "row",
+         show_colnames = FALSE,
+         annotation_col = annotation_col,
+         main = "Top 50 Variable Genes - Grouped by Condition",
+         fontsize_row = 7)
+```
+
+Lol, it's a bit packed but the heatmap shows the high activity vs low activity genes. Red \<- High Activity Blue \<- Low Activity
+
+Some interesting activity here in the very red spot, seems to be mostly asthmatics in that area.
+
+```{r}
+# Extract asthma status from metadata
+metadata$condition <- ifelse(grepl("TRUE", metadata$`asthma:ch1`), "Asthmatic", "Control")
+
+# Confirm counts
+table(metadata$condition)
+
+# Add condition info to PCA data
+pca_df$condition <- metadata$condition
+
+# Plot with color by asthma/control
+ggplot(pca_df, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "PCA: Asthmatic vs Control", color = "Condition")
+
+```
+
+```{r}
+# Create a group factor based on asthma status
+group <- factor(metadata$condition, levels = c("Control", "Asthmatic"))
+
+# Create design matrix for limma
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+# Fit the linear model
+fit <- lmFit(expr_matrix, design)
+
+# Define the contrast (Asthmatic minus Control)
+contrast_matrix <- makeContrasts(Asthmatic - Control, levels = design)
+
+# Apply contrast and empirical Bayes smoothing
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+# Get top differentially expressed genes
+top_genes <- topTable(fit2, adjust = "fdr", number = 20)
+knitr::kable(top_genes, caption = "Top 20 Differentially Expressed Genes")
+
+```
+
+```{r}
+# Store *all* DE results in 'results'
+results <- topTable(fit2, number = Inf, adjust = "fdr")
+
+top_genes <- results %>% 
+  arrange(P.Value) %>% 
+  slice_head(n = 10)
+```
+
+```{r}
+ggplot(results, aes(logFC, -log10(P.Value))) +
+  geom_point(alpha = 0.1, color = "black") +
+  geom_point(data = top_genes, aes(logFC, -log10(P.Value)), color = "red", size = 2) +
+  geom_text(data = top_genes, aes(label = rownames(top_genes)), vjust = 1.5, size = 3) +
+  labs(title = "Volcano Plot Highlighting Top 10 Genes")
+```
+
+```{r}
+# Keep top 500 most variable genes
+top_var_genes <- apply(expr_matrix, 1, var) %>% sort(decreasing = TRUE) %>% head(500) %>% names()
+expr_subset <- t(expr_matrix[top_var_genes, ])
+
+# Create dataframe
+expr_df <- as.data.frame(expr_subset)
+expr_df$condition <- factor(metadata$condition, levels = c("Control", "Asthmatic"))
+```
+
+```{r}
+set.seed(3888)
+train_idx <- createDataPartition(expr_df$condition, p = 0.7, list = FALSE)
+train_data <- expr_df[train_idx, ]
+test_data  <- expr_df[-train_idx, ]
+```
+
+```{r}
+preproc <- preProcess(train_data[, -ncol(train_data)], method = c("center", "scale"))
+x_train <- predict(preproc, train_data[, -ncol(train_data)]) %>% as.matrix()
+x_test <- predict(preproc, test_data[, -ncol(test_data)]) %>% as.matrix()
+y_train <- train_data$condition
+y_test <- test_data$condition
+```
+
+```{r}
+lasso_fit <- cv.glmnet(x_train, y_train, alpha = 1, family = "binomial")
+lasso_probs <- predict(lasso_fit, x_test, s = "lambda.min", type = "response")
+lasso_pred <- ifelse(lasso_probs > 0.5, "Asthmatic", "Control") %>% factor(levels = levels(y_test))
+```
+
+```{r}
+ridge_fit <- cv.glmnet(x_train, y_train, alpha = 0, family = "binomial")
+ridge_probs <- predict(ridge_fit, x_test, s = "lambda.min", type = "response")
+ridge_pred <- ifelse(ridge_probs > 0.5, "Asthmatic", "Control") %>% factor(levels = levels(y_test))
+```
+
+```{r}
+rf_fit <- randomForest(condition ~ ., data = train_data, ntree = 100)
+rf_pred <- predict(rf_fit, newdata = test_data)
+rf_probs <- predict(rf_fit, newdata = test_data, type = "prob")[, "Asthmatic"]
+```
+
+```{r}
+svm_fit <- svm(x_train, y_train, kernel = "linear", probability = TRUE)
+svm_pred <- predict(svm_fit, x_test)
+svm_probs <- attr(predict(svm_fit, x_test, probability = TRUE), "probabilities")[, "Asthmatic"]
+```
+
+```{r}
+knn_pred <- knn(x_train, x_test, cl = y_train, k = 5)
+```
+
+```{r}
+cat("\nConfusion Matrix - Lasso\n")
+print(confusionMatrix(lasso_pred, y_test))
+
+cat("\nConfusion Matrix - Ridge\n")
+print(confusionMatrix(ridge_pred, y_test))
+
+cat("\nConfusion Matrix - Random Forest\n")
+print(confusionMatrix(rf_pred, y_test))
+
+cat("\nConfusion Matrix - SVM\n")
+print(confusionMatrix(svm_pred, y_test))
+
+cat("\nConfusion Matrix - KNN\n")
+print(confusionMatrix(knn_pred, y_test))
+```
+
+```{r}
+roc_lasso <- roc(y_test, as.numeric(lasso_probs))
+roc_ridge <- roc(y_test, as.numeric(ridge_probs))
+roc_rf    <- roc(y_test, rf_probs)
+roc_svm   <- roc(y_test, svm_probs)
+
+plot(roc_lasso, col = "red", main = "ROC Curves", lwd = 2)
+plot(roc_ridge, col = "blue", add = TRUE, lwd = 2)
+plot(roc_rf, col = "green", add = TRUE, lwd = 2)
+plot(roc_svm, col = "purple", add = TRUE, lwd = 2)
+legend("bottomright", legend = c("Lasso", "Ridge", "Random Forest", "SVM"),
+       col = c("red", "blue", "green", "purple"), lwd = 2)
+```
+
+```{r}
+auc_df <- data.frame(
+  Model = c("Lasso", "Ridge", "Random Forest", "SVM"),
+  AUC = c(
+    auc(roc_lasso),
+    auc(roc_ridge),
+    auc(roc_rf),
+    auc(roc_svm)
+  )
+)
+print(auc_df)
+```

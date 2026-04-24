@@ -1,0 +1,1531 @@
+---
+title: "DATA3888 Biomed-25 Final Report"
+output:
+  html_document:
+    self_contained: true # Creates a single HTML file as output
+    code_folding: hide # Code folding; allows you to show/hide code chunks
+    code_download: true # Includes a menu to download the code file
+    toc: true # (Optional) Creates a table of contents!
+    toc_float: true # table of contents at the side
+    number_sections: true # (Optional) Puts numbers next to heading/subheadings
+format: 
+  html: 
+    ### IMPORTANT
+    embed-resources: true # Creates a single HTML file as output
+    code-fold: true # Code folding; allows you to show/hide code chunks
+    ### USEFUL ###
+    code-tools: true # Includes a menu to download the code file
+    ### OPTIONAL ###
+    code-line-numbers: true # Line numbers in code chunks
+    df-print: paged # Sets how dataframes are automatically printed
+execute: 
+  warning: false
+table-of-contents: true # (Useful) Creates a table of contents!
+number-sections: true # (Optional) Puts numbers next to heading/subheadings
+---
+
+# Abstract
+
+**Background:** Asthma is a chronic health condition influenced by both genetic and environmental factors (Australian Government Department of Health, 2018). Early diagnosis and severity classification could significantly benefit pediatric populations and reduce the burden on public healthcare systems in Australia. This study develops a two-stage gene expression based risk predictor to determine asthma risk and severity using multiple publicly available datasets.
+
+**Methods:** We used 5 gene expression datasets (GSE40732, GSE67472, GSE143303, GSE40888, GSE64913), comprising 465 samples (256 asthmatic, 209 healthy). After preprocessing, batch effects were corrected using ComBat. The Primary model built distinguished healthy from asthmatic children using a Random Forest classifier on the top 20 DE genes, while the secondary model classified asthma severity using a kNN classifier on the top 5 DE genes. These were tested using leave-one-dataset-out and 5-fold cross validation. These models were implemented into a Shiny web application, tailored for government audiences, as a proof of concept for this healthcare initiative to be implemented in major Australian cities (@fig-project-workflow).
+
+**Results:** The primary model achieved relatively high performance in distinguishing asthmatic children from healthy ones, with 71% accuracy. The secondary model successfully classified moderate and severe asthma, with 89% precision. Compared to the baseline 1-step model, the 2-step binary classifier performed better in terms of both accuracy (63% vs 54%) and precision (63% vs 61%).
+
+**Conclusion:** Our 2-stage model effectively distinguishes between healthy and asthmatic children, and classifies asthma severity. It shows potential for early diagnosis and stratified treatment, with applications in real-world clinical settings. Future improvements could include integrating more biomarkers or clinical data to enhance model performance across diverse populations.
+
+```{r}
+#| label: fig-project-workflow
+#| fig-cap: "PCA results after batch correction."
+#| fig-align: center
+
+knitr::include_graphics("figure1_final.png")
+```
+
+# Aim and Background
+
+Asthma is a chronic respiratory condition characterized by airway inflammation, leading to recurrent episodes of wheezing, breathlessness, chest tightness and coughing. In Australia, this condition costs the nation over \$27.9 Billion annually, and affects approximately 1 in 9 Australian children (AIHW, 2024). Current approaches around the diagnosis and management of asthma are mostly reactive in nature, focusing on treatment only after symptoms have already appeared.
+
+While medications and management plans can reduce the severity and length of symptoms, there is limited emphasis by the government on proactive, early detection to identify at-risk individuals before the onset of clinical symptoms. The early identification of at-risk individuals will allow for the implementation of tailored prevention strategies for these individuals.
+
+The aim of this project is to address this gap by improving early detection and prevention of pediatric asthma. By utilising bioinformatics and data science techniques to analyse gene expression datasets, we aim to develop a predictive model that can identify at-risk children before symptoms arise. This approach enables targeted interventions, reduces healthcare system burden, promotes better long-term health outcomes for children and families, as well as delivering broader economic benefits for the Australian community.
+
+# Data Collection and Exploration
+
+In this study, we integrated five gene expression datasets from the Gene Expression Omnibus (GEO), comprising a total of 465 samples. Dataset selection was driven by our focus on pediatric asthma across populations, inclusion of healthy controls and platform compatibility to enable reliable gene mapping across different microarray technologies like Illumina HumanHT-12 and Affymetrix.
+
+The final datasets used for model training were GSE40732, GSE67472, GSE143303, GSE40888 and GSE64913. Each dataset underwent rigorous pre-processing, where probe-level annotations were mapped to standardised gene symbols using appropriate annotation packages. Expression values were then aggregated at the gene symbol level by computing the mean across probes, reducing redundancy and harmonising data resolution. This normalisation resulted in gene expression matrices with 18,000-45,000 symbols per dataset, and 14,234 common genes across all 5, which formed a robust core feature set for downstream modelling.
+
+Together, these datasets offered a well-balanced cohort comprising 256 asthmatic and 209 healthy samples, with further identification of 108 moderate and 128 severe cases. This balance minimised the need for synthetic oversampling or undersampling techniques, reduced potential biases introduced through resampling methods and improved the reliability of our classifier.
+
+Exploratory analysis, including boxplots (Appendix @fig-boxplot-full) and Principal Component Analysis (PCA) (@fig-pca), revealed pronounced batch effects, with samples clustering by dataset origin rather than biological phenotype. Notably, PCA of GSE40888 and GSE67472 revealed internal batch structures, with distinct sub-clusters. This suggested inconsistencies in data handling when uploaded to GEO, and hence was split by PC1 sign and treated as independent cohorts for modelling.
+
+To address batch effects, we applied ComBat batch correction iteratively within each model’s CV loop, using dataset identity as the batch covariate. Post-correction PCA (@fig-pca) confirmed the effective removal of dataset driven biases, while preserving meaningful class separation. Differential expression analysis using limma identified 915-2,043 significant genes (adjusted p-value \< 0.05) per iteration. Comparison of the top 100 DE genes across iterations revealed moderate overlap of 15-31 genes, reflecting both biological heterogeneity and population-specific variation across cohorts.
+
+The ComBat batch correction was applied to the merged expression matrix within the loop for each model iteration, using dataset identity as the batch variable. The PCA plots in @fig-pca demonstrate the successful elimination of dataset-driven clustering, while preserving class-related separation patterns. Once corrected, we conducted differential expression analysis using the limma package to identify 915–2,043 significantly expressed genes (adjusted p-value \< 0.05) across each iteration, indicating substantial biological signals within the data.
+
+
+
+```{r}
+#| label: fig-pca
+#| fig-cap: "PCA plots showing batch and condition separation before and after ComBat correction."
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("pcaplots.png")
+```
+
+# Model Development
+
+In order to develop a robust and generalisable risk prediction model, we adopted a structured 2-stage binary pipeline, integrating the relevant gene expression datasets. This allowed us to separately address the classification of healthy vs asthmatic individuals (primary model), and, conditional on asthma, distinguish between moderate and severe cases (secondary model).
+
+The primary model was trained on all 5 GEO datasets (7 cohorts), each containing labelled gene expression data for both asthmatic and healthy children. We applied leave-one-dataset-out cross validation (LODO-CV) to ensure strong generalisability. At each iteration, the model was trained on six datasets and tested on the seventh, ensuring that the test data remained completely unseen. This was particularly appropriate in biomedical contexts, as the data simulated new and heterogeneous clinical settings.
+
+To evaluate and tune the model and hyperparameters, we tested five different classifiers; k-Nearest Neighbours (kNN), Support Vector Machines (SVM), Random Forests, Naive Bayes and Decision Trees. Each classifier was trained using the top 2, 5, 10 and 20 differentially expressed genes, ranked by statistical significance. DE-feature selection was applied independently within each fold to prevent data leakage and optimise performance.
+
+The secondary model further stratified the asthmatic group into moderate and severe subtypes. We could only infer the asthma subtypes from four of the five datasets, either from the direct results or from the nature of the study design (e.g. GSE64913 was obtained from severe asthma patients). Since not all datasets included both severity cases, we implemented a 5-fold cross-validation with 80/20 train test splits. This enabled us to calculate unbiased performance metrics on each class, and meaningfully evaluate the classifier’s ability to distinguish between moderate and severe cases.
+
+Similar to the primary model, the same classifiers were tested on the top 2, 5, 10 and 20 DE gene subsets.
+
+# Model Results and Selection
+
+Our final model selection was guided by a combination of quantitative metrics, graphical diagnostics and qualitative clinical relevance. We focused on evaluation metrics like accuracy, precision, recall and F1-score, which was computed across each fold in our cross-validation (@fig-performance-metrics). The variance of these performance metrics across different folds demonstrated the model’s robustness to variations in the training data, serving as a reliable indicator of its stability.
+
+```{r, warning = FALSE, message = FALSE}
+#| label: fig-performance-metrics
+#| fig-cap: "Performance Metrics for Primary and Secondary Model"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("performance-metrics.png")
+```
+
+For the primary model, we prioritised accuracy as our main evaluation criterion. Since this stage was responsible for identifying children with asthma from the general population, misclassifications could result in both missed cases (false negatives) or unnecessary further testing (false positives). Given the high base rate of asthma in Australian children, and the downstream costs associated with the secondary evaluation, accuracy was a suitable metric to balance both error types. The 71% accuracy achieved by the Top 20 RF model (@fig-boxplots) reflects its ability to generalise across datasets with heterogeneous sample types and platform originals, which is important for clinical deployment. The model used the top 20 DE genes, which improved class separation but remained interpretable due to their small proportion of the total gene space (\~0.14% of 14,000 genes). The RF model itself is also relatively interpretable in practice as it provides feature importance scores, and is suited toward high-dimensional biological data.
+
+For our secondary model, we prioritised a combination of stability and precision to reduce over-diagnosis, which would unnecessarily burden the public health system through specialist referrals and more aggressive interventions. Given that the current health response to asthma was not completely inadequate, we sought to minimise false positives so that only those who truly needed higher care pathways were identified, whilst also reducing the variability in results. Our Top 5 kNN model achieved 89% precision and 85% accuracy (@fig-boxplots), suggesting strong performance in identifying true severe cases. Notably, we rejected any models that failed to predict any "severe" labels across folds, since their artificially high precision scores of 1.0 indicate an imbalance in the predicted classes. This likely reflects the local neighborhood structure of gene expression patterns for severe asthma cases, which kNN is well-suited to capture, especially in smaller sample sizes where variance-based models may overfit. This approach was also supported by kNN's robustment and simplicity in clinical settings, which made it easier to explain the results to clinicians and end users.
+
+We visualised performance through ROC curves, as seen in the Appendix @fig-roc-primary, to supplement our metrics with more interpretable visualisations. We also qualitatively assessed our models on its interpretability, with a particular emphasis on clinical applicability. This ensured that the final models were not only accurate but also understandable to end users, supporting transparency and trust in real-world healthcare settings.
+
+```{r}
+#| label: fig-boxplots
+#| fig-cap: "Boxplots showing performance results from CV for Primary and Secondary Models"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("boxplots_final.png")
+```
+
+We then benchmarked our innovative 2-step model against a baseline 1-step multiclass approach. This model was trained only on the 4 datasets that could be classified into one of the three class outcomes to ensure fairness and a more consistent evaluation. The 1-step model achieved 54.5% accuracy and 61.5% precision, while the 2-step model achieved 62.8% accuracy and 63.3% precision, validating its advantage in both performance and interpretability. The innovative approach was able to leverage more data, notably those that were not necessarily complete or unavailable, in the primary stage, where only “asthma” or “healthy” labels were required. This method also helped to minimise class imbalances by breaking the prediction task into sub-tasks, where there were 256 asthmatics vs 209 healthy controls in the primary model, and 108 moderate vs 128 severe asthmatics in the second model. Finally, it allowed for targeted optimisation with stage-specific criteria evaluation, making it more aligned with clinical requirements and workflows.
+
+# Model Deployment and Shiny
+
+To demonstrate the practicality of genomics-based asthma screening, we deployed our predictive model through a Shiny web application (@fig-shiny). Designed as a pilot program for government stakeholders, the app aims to showcase how machine learning can be integrated into early intervention programs to support scalable and cost-effective asthma management.
+
+```{r}
+#| label: fig-shiny
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shiny_final.png")
+```
+
+The application enables users to upload gene expression data from children, which would have been obtained from blood tests, and receive an immediate, interpretable asthma risk assessment. Upon upload, the data is automatically validated to ensure it includes the necessary genes and then processed using frozen ComBat parameters specific to the primary model stored in RDS files derived during the model’s training. This step aligns the uploaded sample’s gene expression with the distribution of the training datasets, ensuring consistency across prediction whilst preventing data leakage or requiring re-normalisation in the app, which would be time-consuming in a clinical environment.
+
+The primary model first determines whether the child has asthma or is healthy based on the top 20 genes listed in a RDS file, obtained from model parameter testing. If the result is asthmatic, the system proceeds to the secondary model, which predicts whether the case is moderate or severe. Before the prediction, a copy of the original CSV file is produced and provided to the secondary model. The frozen ComBat parameters specific to the secondary model are then applied to help process the copied CSV file. The model then utilises the list of top 5 genes stored in a RDS file obtained during secondary model testing to make a prediction. The reason that there are 2 different Frozen ComBat parameters and 2 different lists is because the primary and secondary models are trained using different numbers of datasets, resulting in different batch correction and different optimised performance specific to each model. This two-stage structure mirrors the clinical decision-making process and maximises data utility.
+
+The Shiny user interface (UI) has been designed for clarity and accessibility, with the results being displayed in a summary table showing sample names, asthma status and severity level. Based on the predicted outcome, the app conditionally renders an action box recommending the next clinical steps, such as GP referral or allergist consultation. These outputs simulate how a real-world screening workflow with the app may combine decision making and referral guidance.
+
+Additionally, the app includes an overview of model performance metrics, framed in non-technical terms for government and health system professionals. It also dedicated sections outlining the program’s purpose and impact, its economic scalability and how it aligns with preventative healthcare goals, offering a proactive alternative to the current reactive approach to asthma treatment.
+
+As a proof of concept, this Shiny application provides a working demonstration of how gene expression data analysis can be deployed at scale, offering the government a solid foundation for potential future investment and deployment of precision medicine.
+
+# Discussion of Limitations
+
+Although our final 2-stage model for asthma risk prediction provides a promising tool for early diagnosis and stratification in children, it's also critical to be aware of a few shortcomings or issues in our approach.
+
+One major problem we faced was the inconsistency and unavailability of public datasets. Even though we merged several GEO-datasets, there were significant differences in their sample dimensions, structures, and metadata annotation. Asthma severity labels were often incomplete or ambiguous, requiring us to infer classifications based on the study design. As a result, some datasets contained only healthy controls and either moderate or severe asthma bases, but not both severity classes. This imbalance complicated batch correction and normalisation processes, since differences between severity groups couldn’t be fully accounted for in datasets that lacked one of the subtypes, potentially limiting the effectiveness of harmonisation across cohorts. Additionally, this posed an additional challenge during model training and evaluation of the secondary classifier, leading us to adopt an 80/20 stratified train test split over leave-one-dataset-out cross validation, which may have impacted the stability or generalisability of our evaluation metrics.
+
+Another significant problem was the technical variability between datasets, stemming from different sample types, gene expression platforms and inconsistent preprocessing procedures that caused a loss of information. Some datasets were derived from blood samples (GSE40732, GSE40888) while others came from airway tissue (GSE67472, GSE143303, GSE64913), which differed in cellular composition and biological context. Whilst we tried to correct for this using ComBat, the inherent differences could have introduced variability unrelated to disease status, complicating our batch correction efforts and limiting the interpretability of our integrated analysis.
+
+Finally, since most datasets are from Western populations, the generalisability of the model to other ethnic or geographic groups remains uncertain. Whilst this is likely sufficient for implementation across Australia, as children would likely be exposed to similar environmental factors, real-world clinical translation still requires more extensive external validation.
+
+# Areas of Future Work
+
+Building upon the results of this study, there are several areas for future work that could help to enhance the model’s robustness, clinical utility and biological relevance. Firstly, implementing the proposed pilot program would provide additional, more suitable blood data from the target population, enabling us to integrate more high-quality data to train our model. This improves generalisability across various populations, whilst also addressing the limitations related to demographic and ethnic representation.
+
+Secondly, there is an opportunity to more closely align the gene symbols used in model training with established asthma-related biomarkers in current literature, including key inflammatory markers and relevant proteins. Currently, only 2 out of the 20 genes utilised in our primary model correspond to known asthma biomarkers, likely reflecting limitations in dataset consistency and matched gene symbols. Enhancing this alignment with validated biomarkers would strengthen the biological validation and improve the model’s interpretability in clinical settings.
+
+Finally, adding more biomarkers such as environmental exposure data and clinical information could help us build a richer model that takes into account the various different factors that contribute to asthma. This would allow us to better capture how various exposures and conditions affect asthma risk and severity.
+
+# Conclusion
+This project demonstrates the application of bioinformatics and machine learning to integrate multiple gene expression datasets for early asthma risk prediction in children. The final two-stage model, leveraging random forests and kNN classifiers, outperformed a standard one-step multiclass model by prioritising stage-specific evaluation and leveraging dataset-specific batch correction. 
+
+Despite challenges of inconsistent datasets, variable annotation, and demographic skew, the deployment of this model as a Shiny application showcases practical steps for real-world integration. Future work should focus on increasing dataset diversity, introduction of new biomarkers, and external validation to increase model generalisability and clinical utility for more precise health applications. 
+
+# Appendix
+
+Full Code for models and shiny can be found on our GitHub here: https://github.sydney.edu.au/aelm4726/DATA3888
+
+## Loading Data
+
+### GSE40732
+
+```{r}
+library(GEOquery)
+```
+
+```{r}
+gse <- getGEO(filename = "GSE40732_series_matrix.txt.gz")
+```
+
+```{r}
+expr_matrix <- exprs(gse)
+
+pheno_data_40732 <- pData(gse)
+
+feature_data_40732 <- fData(gse)
+```
+
+```{r}
+# Filter rows where rownames begin with "NM_"
+nm_rows <- grep("^NM_", rownames(expr_matrix), value = TRUE)
+expr_matrix_nm <- expr_matrix[nm_rows, ]
+
+# Trim last 6 characters from each rowname (accession suffix)
+refseq_ids <- rownames(expr_matrix_nm)
+```
+
+```{r}
+# Load org.Hs.eg.db to map NM_ accessions to gene symbols
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  install.packages("BiocManager")
+  BiocManager::install("org.Hs.eg.db")
+}
+```
+
+```{r}
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+```
+
+```{r}
+gene_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(refseq_ids),
+  columns = c("REFSEQ", "SYMBOL"),
+  keytype = "REFSEQ"
+)
+
+# Convert expression matrix to data frame and join with gene symbols
+expr_df <- as.data.frame(expr_matrix_nm)
+expr_df$RefSeq <- rownames(expr_df)
+
+# Merge the expression matrix with gene symbol annotations
+expr_annotated <- merge(expr_df, gene_map, by.x = "RefSeq", by.y = "REFSEQ", all.x = TRUE)
+
+expr_annotated <- expr_annotated[, c("SYMBOL", setdiff(names(expr_annotated), "SYMBOL"))]
+
+
+```
+
+```{r}
+library(dplyr)
+
+# Remove rows with NA gene symbols
+expr_annotated_clean <- expr_annotated[!is.na(expr_annotated$SYMBOL), ]
+
+# Group by SYMBOL and calculate row-wise mean for each gene
+# We'll exclude the "RefSeq" column and average across all sample columns
+expr_aggregated <- expr_annotated_clean %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE))
+
+expr_matrix_40732 <- as.data.frame(expr_aggregated)
+rownames(expr_matrix_40732) <- expr_matrix_40732$SYMBOL
+expr_matrix_40732$SYMBOL <- NULL
+```
+
+```{r}
+library(limma)
+
+# Create group labels (Asthma vs Control)
+group_40732 <- factor(ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control"))
+
+# Create design matrix
+design_40732 <- model.matrix(~0 + group_40732)
+colnames(design_40732) <- levels(group_40732)
+
+# Fit linear model
+fit_40732 <- lmFit(expr_matrix_40732, design_40732)
+
+# Create contrast: Asthma vs Control
+contrast_40732 <- makeContrasts(Asthma - Control, levels = design_40732)
+fit2_40732 <- contrasts.fit(fit_40732, contrast_40732)
+fit2_40732 <- eBayes(fit2_40732)
+
+# Get all DE results
+de_results_40732 <- topTable(fit2_40732, number = Inf, sort.by = "P")
+
+top100_40732 <- rownames(de_results_40732)[order(de_results_40732$P.Value)][1:100]
+```
+
+### GSE67472
+
+```{r}
+library(GEOquery)
+library(affy)
+
+if (!file.exists("GSE67472_RAW.tar")) {
+  download.file("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE67nnn/GSE67472/suppl/GSE67472_RAW.tar",
+                destfile = "GSE67472_RAW.tar", mode = "wb")
+}
+
+# Extract the CEL files if you haven't already
+untar("GSE67472_RAW.tar", exdir = "GSE67472/")
+
+# Read CEL files
+cel_files <- list.celfiles("GSE67472/", full.names = TRUE)
+
+# Load raw data
+raw_data <- ReadAffy(filenames = cel_files)
+
+# Normalize using RMA
+norm_data <- rma(raw_data)
+
+# Extract expression matrix
+expr_matrix_new <- exprs(norm_data)
+
+```
+
+```{r}
+library(hgu133plus2.db)
+
+# Map probe IDs to Gene Symbols
+gene_symbols <- mapIds(hgu133plus2.db,
+                       keys = rownames(expr_matrix_new),
+                       column = "SYMBOL",
+                       keytype = "PROBEID",
+                       multiVals = "first")
+
+```
+
+```{r}
+# Keep only rows that map to a gene symbol
+expr_matrix_filtered <- expr_matrix_new[!is.na(gene_symbols), ]
+
+# Replace rownames with gene symbols
+rownames(expr_matrix_filtered) <- gene_symbols[rownames(expr_matrix_filtered)]
+
+# Convert to data frame for aggregation
+expr_df <- as.data.frame(expr_matrix_filtered)
+
+# Collapse rows with the same gene symbol by averaging across columns (samples)
+expr_collapsed <- expr_df %>%
+  group_by(GeneSymbol = rownames(expr_df)) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+# Convert back to matrix-style format with SYMBOLs as rownames
+expr_matrix_67472 <- as.data.frame(expr_collapsed)
+rownames(expr_matrix_67472) <- expr_matrix_67472$GeneSymbol
+expr_matrix_67472$GeneSymbol <- NULL
+
+colnames(expr_matrix_67472) <- sub("_.*", "", colnames(expr_matrix_67472))
+```
+
+```{r}
+gse_67472 <- getGEO(filename = "GSE67472_series_matrix.txt.gz")
+
+# Extract phenotype data
+pheno_data_67472 <- pData(gse_67472)
+```
+
+### GSE40888
+
+```{r}
+gse_40888 <- getGEO(filename = "GSE40888_series_matrix.txt.gz")
+```
+
+```{r}
+expr_matrix_40888 <- exprs(gse_40888)
+
+pheno_data_40888 <- pData(gse_40888)
+
+feature_data_40888 <- fData(gse_40888)
+```
+
+
+```{r}
+# Extract probe ID → SYMBOL correspondence (from gene_assignment)
+library(stringr)
+library(dplyr)
+
+probe2symbol <- feature_data_40888 %>%
+  mutate(SYMBOL = str_split_fixed(gene_assignment, " // ", 3)[,2]) %>%
+  dplyr::select(ID, SYMBOL) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "")
+```
+
+```{r}
+# Combining expression matrices with SYMBOL
+expr_df_40888 <- as.data.frame(expr_matrix_40888)
+expr_df_40888$ID <- rownames(expr_df_40888)
+
+expr_annotated_40888 <- merge(expr_df_40888, probe2symbol, by = "ID")
+
+# Aggregate the expression values of multiple probes for the same gene 
+expr_clean_40888 <- expr_annotated_40888 %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+expr_matrix_40888_clean <- as.data.frame(expr_clean_40888)
+rownames(expr_matrix_40888_clean) <- expr_matrix_40888_clean$SYMBOL
+expr_matrix_40888_clean$SYMBOL <- NULL
+
+```
+
+### GSE143303
+
+```{r}
+cache_dir <- tempdir()  # Get the temporary directory
+cache_files <- list.files(cache_dir, pattern = "GSE143303", full.names = TRUE)
+
+# Remove any cached files related to GSE143304
+file.remove(cache_files)
+library(GEOquery)
+gse143303 <- getGEO("GSE143303", GSEMatrix = TRUE)
+
+pheno_data_143303 <- pData(gse143303[[1]])
+```
+
+```{r}
+expr_matrix_gse143303 <- exprs(gse143303[[1]])
+fdata_gse143303 <- fData(gse143303[[1]])
+expr_df_gse143303 <- as.data.frame(expr_matrix_gse143303)
+
+```
+
+```{r}
+expr_df_gse143303 <- as.data.frame(expr_matrix_gse143303)
+expr_df_gse143303$Symbol <- fdata_gse143303$Symbol[match(rownames(expr_df_gse143303), rownames(fdata_gse143303))]
+expr_df_gse143303 <- expr_df_gse143303[, c("Symbol", setdiff(names(expr_df_gse143303), "Symbol"))]
+expr_df_gse143303$Symbol <- as.character(fdata_gse143303$Symbol)
+expr_df_gse143303$Symbol <- as.character(expr_df_gse143303$Symbol)
+```
+
+```{r}
+expr_df_gse143303_clean <- expr_df_gse143303[!is.na(expr_df_gse143303$Symbol), ]
+ 
+```
+
+```{r}
+#head(expr_df_gse143303)
+
+
+expr_aggregated_gse143303 <- expr_df_gse143303_clean %>%
+  group_by(Symbol) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE))
+
+expr_matrix_gse143303_cleaned <- as.data.frame(expr_aggregated_gse143303)
+
+# Set 'Symbol' as row names and remove it from the data frame since it is now row names
+rownames(expr_matrix_gse143303_cleaned) <- expr_matrix_gse143303_cleaned$Symbol
+expr_matrix_gse143303_cleaned$Symbol <- NULL  # Remove 'Symbol' column
+
+```
+
+### GSE64913
+
+```{r}
+# Load GSE64913
+gse_64913 <- getGEO(filename = "GSE64913_series_matrix.txt.gz")
+
+# Extract expression matrix
+expr_matrix_64913 <- exprs(gse_64913)
+
+# Extract phenotype (sample info)
+pheno_data_64913 <- pData(gse_64913)
+
+# Extract feature data (probe annotations)
+feature_data_64913 <- fData(gse_64913)
+```
+
+```{r}
+if ("Gene Symbol" %in% colnames(feature_data_64913)) {
+  probe2symbol_64913 <- feature_data_64913 %>%
+    dplyr::select(ID, SYMBOL = `Gene Symbol`) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "")
+} else if ("gene_assignment" %in% colnames(feature_data_64913)) {
+  # Fallback for gene_assignment format (like 40888)
+  probe2symbol_64913 <- feature_data_64913 %>%
+    mutate(SYMBOL = str_split_fixed(gene_assignment, " // ", 3)[,2]) %>%
+    dplyr::select(ID, SYMBOL) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "")
+}
+```
+
+```{r}
+# Merge expression data with SYMBOL
+expr_df_64913 <- as.data.frame(expr_matrix_64913)
+expr_df_64913$ID <- rownames(expr_df_64913)
+
+expr_annotated_64913 <- merge(expr_df_64913, probe2symbol_64913, by = "ID")
+
+# Collapse multiple probes per gene by averaging
+expr_clean_64913 <- expr_annotated_64913 %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+
+expr_matrix_64913_clean <- as.data.frame(expr_clean_64913)
+rownames(expr_matrix_64913_clean) <- expr_matrix_64913_clean$SYMBOL
+expr_matrix_64913_clean$SYMBOL <- NULL
+
+```
+
+## EDA
+
+### PCA Plots
+
+```{r, warning=FALSE, message=FALSE}
+# Load required libraries
+library(limma)
+library(sva)
+library(ggplot2)
+
+common_genes_total <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40732),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472),
+  rownames(expr_matrix_40888_clean)
+))
+
+pheno_data_64913 <- pheno_data_64913[colnames(expr_matrix_64913_clean), ]
+pheno_data_40888 <- pheno_data_40888[colnames(expr_matrix_40888_clean), ]
+pheno_data_143303 <- pheno_data_143303[colnames(expr_matrix_gse143303_cleaned), ]
+pheno_data_67472 <- pheno_data_67472[colnames(expr_matrix_67472), ]
+pheno_data_40732 <- pheno_data_40732[colnames(expr_matrix_40732), ]
+
+
+labels_64913 <- ifelse(grepl("Asthmatic", pheno_data_64913$characteristics_ch1.1, ignore.case = TRUE), "Asthma", "Control")
+labels_40888 <- ifelse(grepl("asthmatic", pheno_data_40888$`characteristics_ch1.3`, ignore.case = TRUE), "Asthma", "Control")
+labels_143303 <- ifelse(pheno_data_143303$characteristics_ch1.1 == "disease status: Severe asthma", "Asthma", "Control")
+labels_67472 <- ifelse(grepl("asthma", pheno_data_67472$`disease state:ch1`, ignore.case = TRUE), "Asthma", "Control")
+labels_40732 <- ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), "Asthma", "Control")
+
+train_labels <- factor(c(labels_64913, labels_40888, labels_143303, labels_67472, labels_40732))
+
+datasets <- list(
+  GSE40732 = expr_matrix_40732[common_genes_total, ],
+  GSE67472 = expr_matrix_67472[common_genes_total, ],
+  GSE143303 = expr_matrix_gse143303_cleaned[common_genes_total, ],
+  GSE40888 = expr_matrix_40888_clean[common_genes_total, ],
+  GSE64913 = expr_matrix_64913_clean[common_genes_total, ]
+)
+
+# Combine expression matrices into one large matrix
+all_expr <- do.call(cbind, datasets)
+
+# Generate a batch vector from the list names
+batch <- rep(seq_along(datasets), times = sapply(datasets, ncol))
+batch_labels <- rep(names(datasets), times = sapply(datasets, ncol))
+
+# PCA on uncorrected data
+pca_uncorrected <- prcomp(t(all_expr), scale. = TRUE)
+
+# Plot uncorrected PCA
+pca_df_uncorrected <- data.frame(
+  Sample = colnames(all_expr),
+  PC1 = pca_uncorrected$x[, 1],
+  PC2 = pca_uncorrected$x[, 2],
+  Batch = batch_labels
+)
+
+gg_uncorrected <- ggplot(pca_df_uncorrected, aes(x = PC1, y = PC2, color = Batch)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("PCA Before ComBat Correction")
+```
+
+```{r warning=FALSE, message=FALSE}
+pca_67472 <- prcomp(t(datasets$GSE67472), scale. = TRUE)
+pca_40888 <- prcomp(t(datasets$GSE40888), scale. = TRUE)
+
+# Split samples on PC1 sign
+samples_67472_pos <- colnames(datasets$GSE67472)[pca_67472$x[, 1] > 0]
+samples_67472_neg <- colnames(datasets$GSE67472)[pca_67472$x[, 1] <= 0]
+
+samples_40888_pos <- colnames(datasets$GSE40888)[pca_40888$x[, 1] > 0]
+samples_40888_neg <- colnames(datasets$GSE40888)[pca_40888$x[, 1] <= 0]
+
+# Create new batch-specific expression matrices
+expr_matrix_67472_batch1 <- datasets$GSE67472[, samples_67472_pos, drop = FALSE]
+expr_matrix_67472_batch2 <- datasets$GSE67472[, samples_67472_neg, drop = FALSE]
+
+expr_matrix_40888_batch1 <- datasets$GSE40888[, samples_40888_pos, drop = FALSE]
+expr_matrix_40888_batch2 <- datasets$GSE40888[, samples_40888_neg, drop = FALSE]
+
+# Rebuild datasets
+datasets_corrected <- datasets
+datasets_corrected$GSE67472 <- NULL
+datasets_corrected$GSE40888 <- NULL
+
+datasets_corrected$GSE67472_batch1 <- expr_matrix_67472_batch1
+datasets_corrected$GSE67472_batch2 <- expr_matrix_67472_batch2
+
+datasets_corrected$GSE40888_batch1 <- expr_matrix_40888_batch1
+datasets_corrected$GSE40888_batch2 <- expr_matrix_40888_batch2
+
+# Recombine expression matrix
+all_expr_corrected <- do.call(cbind, datasets_corrected)
+
+batch_labels_corrected <- rep(names(datasets_corrected), sapply(datasets_corrected, ncol))
+
+# ComBat correction
+combat_corrected <- ComBat(dat = as.matrix(all_expr_corrected), batch = batch_labels_corrected, par.prior = TRUE)
+
+# PCA after correction
+pca_corrected <- prcomp(t(combat_corrected), scale. = TRUE)
+
+# Plot corrected PCA
+pca_df_corrected <- data.frame(
+  Sample = colnames(all_expr_corrected),
+  PC1 = pca_corrected$x[, 1],
+  PC2 = pca_corrected$x[, 2],
+  Batch = batch_labels_corrected
+)
+
+gg_corrected <- ggplot(pca_df_corrected, aes(x = PC1, y = PC2, color = Batch)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("PCA After ComBat Correction")
+```
+
+```{r}
+# PCA plot of corrected data, colored by condition
+pca_df_corrected$Condition <- train_labels
+
+gg_condition_model1 <- ggplot(pca_df_corrected, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("PCA After ComBat Correctionfor Model 1 (by Condition)")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Create condition labels
+labels_40732 <- ifelse(grepl("subtype: non", pheno_data_40732$characteristics_ch1.1), "healthy",
+                 ifelse(grepl("subtype: reversible|subtype: PC20", pheno_data_40732$characteristics_ch1.1), "moderate", "severe"))
+
+labels_67472 <- ifelse(pheno_data_67472$`disease state:ch1` == "asthma", "moderate", "healthy")
+
+labels_143303 <- ifelse(grepl("Severe asthma", pheno_data_143303$characteristics_ch1.1), "severe", "healthy")
+
+labels_64913 <- ifelse(grepl("Severe Asthmatic", pheno_data_64913$characteristics_ch1.1), "severe", "healthy")
+
+# Get common genes and subset expression matrices
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40732),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472)
+))
+
+raw_expr_matrix <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472[common_genes_all, ]
+)
+
+combined_labels <- c(labels_64913, labels_40732, labels_143303, labels_67472)
+
+# Create batch labels (with GSE67472 split by PCA)
+pca_67472 <- prcomp(t(expr_matrix_67472[common_genes_all, ]), scale. = TRUE)
+pc1_67472 <- pca_67472$x[, 1]
+sub_batch_67472 <- ifelse(pc1_67472 >= 0, "batch1_67472", "batch2_67472")
+
+batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40732", ncol(expr_matrix_40732)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  sub_batch_67472
+)
+
+# ComBat batch correction with condition as covariate
+mod <- model.matrix(~ combined_labels)
+combat_corrected_expr <- ComBat(
+  dat = raw_expr_matrix,
+  batch = batch_labels,
+  mod = mod,
+  par.prior = TRUE
+)
+
+# PCA on corrected expression data
+pca_combat <- prcomp(t(combat_corrected_expr), scale. = TRUE)
+
+pca_df_combat <- data.frame(
+  PC1 = pca_combat$x[, 1],
+  PC2 = pca_combat$x[, 2],
+  Condition = combined_labels
+)
+
+# Plot PCA by condition
+gg_condition_model2 <- ggplot(pca_df_combat, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 2, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA of ComBat-Corrected Data for Model 2 (by Condition)", x = "PC1", y = "PC2")
+```
+
+```{r}
+#| label: fig-pca-raw
+#| fig-cap: "PCA plots showing batch and condition separation before and after ComBat correction."
+#| fig-align: center
+#| out-width: 100%
+#| warning: false
+#| message: false
+#| 
+apply_small_theme <- function(plot) {
+  plot +
+    geom_point(size = 0.5) +
+    theme_minimal(base_size = 8) +
+    theme(
+      plot.title = element_text(size = 9),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 7),
+      legend.title = element_text(size = 8),
+      legend.text = element_text(size = 7)
+    )
+}
+
+gg_uncorrected <- apply_small_theme(gg_uncorrected)
+gg_corrected <- apply_small_theme(gg_corrected)
+gg_condition_model1 <- apply_small_theme(gg_condition_model1)
+gg_condition_model2 <- apply_small_theme(gg_condition_model2)
+
+library(patchwork)
+
+(gg_uncorrected | gg_corrected) /
+(gg_condition_model1 | gg_condition_model2)
+```
+
+### Boxplots
+
+```{r}
+merged_full <- cbind(
+  expr_matrix_64913_clean[common_genes_total, ],
+  expr_matrix_40888_clean[common_genes_total, ],
+  expr_matrix_gse143303_cleaned[common_genes_total, ],
+  expr_matrix_67472[common_genes_total, ],
+  expr_matrix_40732[common_genes_total, ]
+)
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Use raw, uncorrected merged data (samples as columns, genes as rows)
+# Transpose to make samples as rows
+expr_for_boxplot_raw <- as.data.frame(t(merged_full))
+expr_for_boxplot_raw$Sample <- rownames(expr_for_boxplot_raw)
+
+# Create dataset labels
+raw_dataset_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888", ncol(expr_matrix_40888_clean)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472", ncol(expr_matrix_67472)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+expr_for_boxplot_raw$Dataset <- factor(raw_dataset_labels)
+
+# Reshape to long format for ggplot
+expr_long_raw <- expr_for_boxplot_raw %>%
+  pivot_longer(-c(Sample, Dataset), names_to = "Gene", values_to = "Expression")
+
+# Reorder samples for plotting clarity
+expr_long_raw$Sample <- factor(expr_long_raw$Sample, levels = expr_for_boxplot_raw$Sample[order(expr_for_boxplot_raw$Dataset)])
+
+# Compute vertical dashed line positions and labels
+sample_counts <- table(expr_for_boxplot_raw$Dataset)
+dataset_boundaries <- cumsum(as.numeric(sample_counts))
+dataset_midpoints <- cumsum(c(0, as.numeric(sample_counts[-length(sample_counts)]))) + as.numeric(sample_counts) / 2
+dataset_names <- names(sample_counts)
+
+# Plot raw boxplot
+boxplot_full <- ggplot(expr_long_raw, aes(x = Sample, y = Expression, fill = Dataset)) +
+  geom_boxplot(outlier.size = 0.2, outlier.alpha = 0.2, width = 0.4) +
+  geom_vline(xintercept = dataset_boundaries[-length(dataset_boundaries)] + 0.5,
+             linetype = "dashed", color = "grey40") +
+  annotate("text", x = dataset_midpoints,
+           y = max(expr_long_raw$Expression, na.rm = TRUE) + 0.5,
+           label = dataset_names,
+           angle = 45, hjust = 0, size = 1.5) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(title = "Expression Distribution per Sample (Pre-ComBat)",
+       x = "Samples (Grouped by Dataset)", y = "Expression") +
+  scale_fill_brewer(palette = "Set2")
+```
+
+```{r}
+#| label: fig-boxplot-full
+#| fig-cap: "Boxplot of Gene Expression Distribution per Sample (Pre-ComBat)"
+#| fig-align: center
+#| out-width: 100%
+
+boxplot_full
+```
+
+
+
+## Model 1 (Primary Model)
+
+```{r, warning = FALSE, message = FALSE}
+# Model 1 Code
+library(caret)
+library(limma)
+library(dplyr)
+library(ggplot2)
+
+# Define labels
+labels_64913 <- ifelse(grepl("Asthmatic", pheno_data_64913$characteristics_ch1.1, ignore.case = TRUE),
+                       "Asthma", "Control")
+
+labels_40888_all <- ifelse(grepl("asthmatic", pheno_data_40888$characteristics_ch1.3, ignore.case = TRUE),
+                           "Asthma", "Control")
+labels_40888 <- labels_40888_all
+names(labels_40888) <- rownames(pheno_data_40888)
+
+labels_143303 <- ifelse(pheno_data_143303$characteristics_ch1.1 == "disease status: Severe asthma",
+                        "Asthma", "Control")
+names(labels_143303) <- rownames(pheno_data_143303)
+
+labels_67472_all <- ifelse(grepl("asthma", pheno_data_67472$`disease state:ch1`, ignore.case = TRUE),
+                           "Asthma", "Control")
+labels_67472 <- labels_67472_all
+names(labels_67472) <- rownames(pheno_data_67472)
+
+labels_40732 <- ifelse(grepl("TRUE", pheno_data_40732$characteristics_ch1), 
+                       "Asthma", "Control")
+names(labels_40732) <- rownames(pheno_data_40732)
+
+expr_matrix_64913_clean <- data.matrix(expr_matrix_64913_clean)
+expr_matrix_40888_batch1 <- data.matrix(expr_matrix_40888_batch1)
+expr_matrix_40888_batch2 <- data.matrix(expr_matrix_40888_batch2)
+expr_matrix_gse143303_cleaned <- data.matrix(expr_matrix_gse143303_cleaned)
+expr_matrix_67472_batch1 <- data.matrix(expr_matrix_67472_batch1)
+expr_matrix_67472_batch2 <- data.matrix(expr_matrix_67472_batch2)
+expr_matrix_40732 <- data.matrix(expr_matrix_40732)
+
+# STEP 2: Combine datasets
+combat_train_t_aligned <- t(cbind(
+  expr_matrix_64913_clean[common_genes_total, ],
+  expr_matrix_40888_batch1[common_genes_total, ],
+  expr_matrix_40888_batch2[common_genes_total, ],
+  expr_matrix_gse143303_cleaned[common_genes_total, ],
+  expr_matrix_67472_batch1[common_genes_total, ],
+  expr_matrix_67472_batch2[common_genes_total, ],
+  expr_matrix_40732[common_genes_total, ]
+))
+
+# STEP 3: Create batch labels
+full_batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40888_batch1", ncol(expr_matrix_40888_batch1)),
+  rep("GSE40888_batch2", ncol(expr_matrix_40888_batch2)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  rep("GSE67472_batch1", ncol(expr_matrix_67472_batch1)),
+  rep("GSE67472_batch2", ncol(expr_matrix_67472_batch2)),
+  rep("GSE40732", ncol(expr_matrix_40732))
+)
+
+# STEP 4: Create labels
+train_labels <- c(
+  labels_64913,
+  labels_40888[colnames(expr_matrix_40888_batch1)],
+  labels_40888[colnames(expr_matrix_40888_batch2)],
+  labels_143303,
+  labels_67472[colnames(expr_matrix_67472_batch1)],
+  labels_67472[colnames(expr_matrix_67472_batch2)],
+  labels_40732
+)
+
+# STEP 5: Expression matrix
+expr_matrix <- combat_train_t_aligned
+labels <- train_labels
+groups <- full_batch_labels
+
+# STEP 6: DE gene selection
+get_top_genes <- function(expr_matrix, labels, top_n) {
+  expr_matrix <- data.matrix(expr_matrix)
+  design <- model.matrix(~labels)
+  fit <- lmFit(t(expr_matrix), design)
+  fit <- eBayes(fit)
+  topTableRes <- topTable(fit, number = top_n, sort.by = "P")
+  rownames(topTableRes)
+}
+
+
+# 7 Fold-CV
+results_list <- list()
+top_gene_sets <- c(2, 5, 10, 20)
+folds <- groupKFold(groups, k = length(unique(groups)))
+
+for (n_genes in top_gene_sets) {
+  
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  data_df <- as.data.frame(expr_matrix[, top_genes])
+  data_df$Class <- labels
+  
+  ctrl <- trainControl(index = folds,
+                       savePredictions = "final")
+  
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale"))
+    
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = fit$resample$Accuracy,
+      TopGenes = paste0("Top", n_genes)
+    )
+    results_list[[length(results_list) + 1]] <- model_results
+    
+  }
+}
+
+# ---- STEP 8: Plot results ----
+# Combine all results from the list into a data frame
+results_df <- bind_rows(results_list)
+
+# Formatting the results to match Model 2 style
+results_df <- results_df %>%
+  mutate(
+    GeneModel = paste(TopGenes, Model, sep = "_"),
+    Model = factor(Model, levels = c("rf", "svmLinear", "knn", "nb", "rpart")),
+    TopGenes = factor(TopGenes, levels = c("Top2", "Top5", "Top10", "Top20"))
+  )
+
+# Simplified model labels (repeats in model order)
+simplified_labels_model1 <- rep(c("RF", "SVM", "KNN", "NB", "DT"), times = length(levels(results_df$TopGenes)))
+
+# Preserve order of x-axis
+gene_model_levels_model1 <- c()
+for (g in levels(results_df$TopGenes)) {
+  for (m in levels(results_df$Model)) {
+    gene_model_levels_model1 <- c(gene_model_levels_model1, paste(g, m, sep = "_"))
+  }
+}
+results_df$GeneModel <- factor(results_df$GeneModel, levels = gene_model_levels_model1)
+
+model1_boxplot <- ggplot(results_df, aes(x = GeneModel, y = Accuracy, color = TopGenes)) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  geom_point(size = 1.5, alpha = 0.7, position = position_jitter(width = 0.15)) +
+  scale_x_discrete(labels = simplified_labels_model1) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Accuracy of Classifiers Using Top DE Genes (Model 1)",
+    x = "Model",
+    y = "Accuracy",
+    color = "Gene Set"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+model1_boxplot
+```
+
+### Full performance metrics
+
+```{r}
+library(yardstick)
+
+custom_summary <- function(data, lev = NULL, model = NULL) {
+  prob <- data$prob[, 2]  
+  
+  precision_val <- precision_vec(truth = data$obs, estimate = data$pred, event_level = "second")
+  recall_val <- recall_vec(truth = data$obs, estimate = data$pred, event_level = "second")
+  f1_val <- f_meas_vec(truth = data$obs, estimate = data$pred, event_level = "second")
+  accuracy_val <- mean(data$obs == data$pred)
+  
+  out <- c(Accuracy = accuracy_val, Precision = precision_val, Recall = recall_val, F1 = f1_val)
+  return(out)
+}
+```
+
+
+```{r, warning = FALSE, message = FALSE}
+# 7-fold CV
+full_performance_list <- list()
+top_gene_sets <- c(2, 5, 10, 20)
+folds <- groupKFold(groups, k = length(unique(groups)))
+
+# Define the metrics to be computed
+metrics_list <- c("Accuracy", "Precision", "Recall", "F1")
+
+# Loop over different top-N DE genes
+for (n_genes in top_gene_sets) {
+  
+  top_genes <- get_top_genes(expr_matrix, labels, n_genes)
+  data_df <- as.data.frame(expr_matrix[, top_genes])
+  data_df$Class <- labels
+  
+  # Cross-validation setup (5-fold CV, evaluating multiple metrics)
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    savePredictions = "final",
+    classProbs = TRUE,  # Enable probability predictions for ROC-AUC calculation
+    summaryFunction = custom_summary  # Custom function to calculate multiple metrics
+  )
+  
+  model_list <- c("rf", "svmLinear", "knn", "nb", "rpart")
+  
+  # Run for each model and each top gene set
+  for (model_name in model_list) {
+    set.seed(3888)
+    fit <- train(Class ~ ., data = data_df,
+                 method = model_name,
+                 trControl = ctrl,
+                 preProcess = c("center", "scale")
+    )
+    
+    # Store the results (including multiple metrics)
+    model_results <- data.frame(
+      Model = model_name,
+      Accuracy = mean(fit$resample$Accuracy),
+      Precision = mean(fit$resample$Precision),
+      Recall = mean(fit$resample$Recall),
+      F1 = mean(fit$resample$F1),
+      TopGenes = paste0("Top", n_genes)
+    )
+    
+    full_performance_list[[length(full_performance_list) + 1]] <- model_results
+  }
+}
+
+# Combine all results from the list into a data frame
+performance_df <- bind_rows(full_performance_list)
+
+# Final formatting and print
+performance_df <- performance_df %>%
+  mutate(
+    GeneModel = paste(TopGenes, Model, sep = "_"),
+    Model = factor(Model, levels = c("rf", "svmLinear", "knn", "nb", "rpart")),
+    TopGenes = factor(TopGenes, levels = c("Top2", "Top5", "Top10", "Top20"))
+  )
+
+# Create a table of average metrics for performance (across all models and top gene sets)
+average_metrics_table <- performance_df %>%
+  group_by(Model, TopGenes) %>%
+  summarize(
+    Accuracy = mean(Accuracy),
+    Precision = mean(Precision),
+    Recall = mean(Recall),
+    F1 = mean(F1)
+  ) %>%
+  arrange(Model, TopGenes)
+```
+
+```{r, warning = FALSE, message = FALSE}
+#| label: primary-metrics
+#| fig-cap: "Primary Model Performance Metrics"
+#| fig-align: center
+#| out-width: 100%
+#| 
+library(knitr)
+library(kableExtra)
+
+primary_table <- average_metrics_table %>%
+  kable("html", caption = "Primary Model Performance Metrics Table", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"), full_width = F) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4CAF50") %>%  # Header row styling
+  row_spec(4, background = "lightgreen")  # Highlight the 4th row in light green
+
+```
+
+## Model 2 (Secondary Model)
+
+```{r}
+# Load required packages
+library(sva)
+library(limma)
+library(caret)
+
+# Creating labels
+labels_40732 <- ifelse(grepl("subtype: non", pheno_data_40732$characteristics_ch1.1), "healthy",
+                 ifelse(grepl("subtype: reversible|subtype: PC20", pheno_data_40732$characteristics_ch1.1), "moderate", "severe"))
+
+labels_67472 <- ifelse(pheno_data_67472$`disease state:ch1` == "asthma", "moderate", "healthy")
+
+labels_143303 <- ifelse(grepl("Severe asthma", pheno_data_143303$characteristics_ch1.1), "severe", "healthy")
+
+labels_64913 <- ifelse(grepl("Severe Asthmatic", pheno_data_64913$characteristics_ch1.1), "severe", "healthy")
+
+# Combine Expression and Labels
+common_genes_all <- Reduce(intersect, list(
+  rownames(expr_matrix_64913_clean),
+  rownames(expr_matrix_40732),
+  rownames(expr_matrix_gse143303_cleaned),
+  rownames(expr_matrix_67472)
+))
+
+# Expression matrix
+raw_expr_matrix <- cbind(
+  expr_matrix_64913_clean[common_genes_all, ],
+  expr_matrix_40732[common_genes_all, ],
+  expr_matrix_gse143303_cleaned[common_genes_all, ],
+  expr_matrix_67472[common_genes_all, ]
+)
+
+# Labels
+combined_labels <- c(labels_64913, labels_40732, labels_143303, labels_67472)
+```
+
+```{r}
+pca_67472 <- prcomp(t(expr_matrix_67472[common_genes_all, ]), scale. = TRUE)
+pc1_67472 <- pca_67472$x[, 1]
+
+# Sub-batch labels
+sub_batch_67472 <- ifelse(pc1_67472 >= 0, "batch1_67472", "batch2_67472")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Batch labels
+batch_labels <- c(
+  rep("GSE64913", ncol(expr_matrix_64913_clean)),
+  rep("GSE40732", ncol(expr_matrix_40732)),
+  rep("GSE143303", ncol(expr_matrix_gse143303_cleaned)),
+  sub_batch_67472
+)
+
+# apply ComBat
+mod <- model.matrix(~ combined_labels)
+combat_corrected_expr <- ComBat(dat = raw_expr_matrix, batch = batch_labels, mod = mod, par.prior = TRUE)
+
+# Drop healthy samples
+non_healthy_idx <- which(combined_labels != "healthy")
+expr_non_healthy <- combat_corrected_expr[, non_healthy_idx]
+labels_non_healthy <- combined_labels[non_healthy_idx]
+
+# Differential Expression (Moderate vs Severe)
+design <- model.matrix(~ 0 + factor(labels_non_healthy))
+colnames(design) <- levels(factor(labels_non_healthy))
+fit <- lmFit(expr_non_healthy, design)
+contrast_matrix <- makeContrasts(severe - moderate, levels=design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+top_genes_df <- topTable(fit2, adjust="fdr", number=Inf)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Model 2 Code
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(yardstick)
+
+set.seed(123)
+
+# Custom summary function to compute precision
+precision_summary <- function(data, lev = NULL, model = NULL) {
+  precision_val <- precision_vec(truth = data$obs, estimate = data$pred, event_level = "second")
+  out <- c(Precision = precision_val)
+  return(out)
+}
+
+# Store precision results
+all_results <- data.frame()
+
+# Classifiers to include
+models <- c("knn", "rf", "svmRadial", "nb", "rpart")
+
+# Loop over different top-N DE genes
+for (n in c(2, 5, 10, 20)) {
+  top_genes <- rownames(top_genes_df)[1:n]
+  expr_subset <- t(expr_non_healthy[top_genes, ])
+  
+  df <- data.frame(expr_subset, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+  
+  # Cross-validation setup (5-fold CV, evaluating precision)
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    savePredictions = TRUE,
+    classProbs = FALSE,
+    summaryFunction = precision_summary
+  )
+  
+  # Fit each model
+  for (model in models) {
+    fit <- train(label ~ ., data = df, method = model, metric = "Precision", trControl = ctrl)
+    
+    all_results <- rbind(all_results, data.frame(
+      Precision = fit$resample$Precision,
+      Model = model,
+      TopGenes = paste0("Top_", n)
+    ))
+  }
+}
+
+# Final formatting
+all_results <- all_results %>%
+  mutate(
+    GeneModel = paste(TopGenes, Model, sep = "_"),
+    Model = factor(Model, levels = c("knn", "rf", "svmRadial", "nb", "rpart")),
+    TopGenes = factor(TopGenes, levels = c("Top_2", "Top_5", "Top_10", "Top_20"))
+  )
+
+# Simplified model labels (repeats in model order)
+simplified_labels <- rep(c("KNN", "RF", "SVM", "NB", "DT"), times = length(levels(all_results$TopGenes)))
+
+# Preserve order of x-axis
+gene_model_levels <- c()
+for (g in levels(all_results$TopGenes)) {
+  for (m in levels(all_results$Model)) {
+    gene_model_levels <- c(gene_model_levels, paste(g, m, sep = "_"))
+  }
+}
+all_results$GeneModel <- factor(all_results$GeneModel, levels = gene_model_levels)
+
+# Plot: Boxplot of precision (Model 2)
+model2_boxplot <- ggplot(all_results, aes(x = GeneModel, y = Precision, color = TopGenes)) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  geom_point(size = 1.5, alpha = 0.7, position = position_jitter(width = 0.15)) +
+  scale_x_discrete(labels = simplified_labels) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Precision of Classifiers Using Top DE Genes (Model 2)",
+    x = "Model",
+    y = "Precision",
+    color = "Gene Set"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+model2_boxplot
+```
+
+### Full performance metrics
+
+```{r, warning = FALSE, message = FALSE}
+full_performance_list_2 <- list()
+
+# Classifiers to include
+models <- c("knn", "rf", "svmLinear", "nb", "rpart")
+
+# Loop over different top-N DE genes
+for (n in c(2, 5, 10, 20)) {
+  top_genes <- rownames(top_genes_df)[1:n]
+  expr_subset <- t(expr_non_healthy[top_genes, ])
+  
+  df <- data.frame(expr_subset, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+  
+  # Cross-validation setup (5-fold CV, evaluating multiple metrics)
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    savePredictions = TRUE,
+    classProbs = TRUE,  # Enable probability predictions for ROC-AUC calculation
+    summaryFunction = custom_summary  # Custom function to calculate multiple metrics
+  )
+  
+  # Fit each model and compute metrics
+  for (model in models) {
+    fit <- train(label ~ ., data = df, method = model, trControl = ctrl)
+    
+    # Store the results
+    model_results <- data.frame(
+      Model = model,
+      Accuracy = mean(fit$resample$Accuracy),
+      Precision = mean(fit$resample$Precision),
+      Recall = mean(fit$resample$Recall),
+      F1 = mean(fit$resample$F1),
+      TopGenes = paste0("Top", n)
+    )
+    
+    full_performance_list_2[[length(full_performance_list_2) + 1]] <- model_results
+  }
+}
+
+# Combine all results from the list into a data frame
+performance_df_2 <- bind_rows(full_performance_list_2)
+
+# Final formatting and print
+performance_df_2 <- performance_df_2 %>%
+  mutate(
+    GeneModel = paste(TopGenes, Model, sep = "_"),
+    Model = factor(Model, levels = c("rf", "svmLinear", "knn", "nb", "rpart")),
+    TopGenes = factor(TopGenes, levels = c("Top2", "Top5", "Top10", "Top20"))
+  )
+
+# Create a table of average metrics for performance (across all models and top gene sets)
+average_metrics_table_2 <- performance_df_2 %>%
+  group_by(Model, TopGenes) %>%
+  summarize(
+    Accuracy = mean(Accuracy),
+    Precision = mean(Precision),
+    Recall = mean(Recall),
+    F1 = mean(F1)
+  ) %>%
+  arrange(Model, TopGenes)
+```
+
+```{r, warning = FALSE, message = FALSE}
+#| label: secondary-metrics
+#| fig-cap: "Secondary Model Performance Metrics"
+#| fig-align: center
+#| out-width: 100%
+#| 
+library(knitr)
+library(kableExtra)
+
+secondary_table <- average_metrics_table_2 %>%
+  kable("html", caption = "Secondary Model Performance Metrics Table", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"), full_width = F) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4CAF50") %>%
+  row_spec(10, background = "lightgreen")  # Highlight the 4th row in light green
+```
+
+```{r}
+#| label: fig-boxplots-raw
+#| fig-cap: "Boxplots showing performance results from CV for Primary and Secondary Models"
+#| fig-align: center
+#| out-width: 100%
+#| warning: false
+#| message: false
+
+library(patchwork)
+
+model1_boxplot <- apply_small_theme(model1_boxplot)
+model2_boxplot <- apply_small_theme(model2_boxplot)
+
+# Combine the two boxplots side by side with patchwork
+(model1_boxplot) / 
+  (model2_boxplot)
+```
+
+## Selected Models Performance Metrics
+
+### Primary Model
+```{r}
+#| label: fig-roc-primary
+#| fig-cap: "Primary Model ROC Curve"
+#| fig-align: center
+#| out-width: 100%
+#| warning: false
+#| message: false
+#| 
+library(caret)
+library(pROC)
+
+# Load trained model
+rf_fit <- readRDS("rf_model_top20_genes_with_prob.rds")
+
+# Extract predictions from CV
+preds <- rf_fit$pred
+
+
+if ("mtry" %in% names(preds)) {
+  preds <- preds[preds$mtry == rf_fit$bestTune$mtry, ]
+}
+
+
+# Plot ROC
+roc_obj <- roc(response = preds$obs, predictor = preds$Asthma, levels = c("Control", "Asthma"))
+plot(roc_obj, col = "blue", lwd = 2, main = "ROC Curve for RF (Top 20 DE Genes)")
+auc_val <- auc(roc_obj)
+```
+
+### Secondary Model
+
+```{r}
+#| label: fig-roc-secondary
+#| fig-cap: "Secondary Model ROC Curve"
+#| fig-align: center
+#| out-width: 100%
+#| warning: false
+#| message: false
+
+
+set.seed(123)
+
+top5_genes <- rownames(top_genes_df)[1:5]
+expr_top5 <- t(expr_non_healthy[top5_genes, ])
+
+df_final <- data.frame(expr_top5, label = factor(labels_non_healthy, levels = c("moderate", "severe")))
+
+# Train kNN model with probability prediction enabled
+final_knn_model <- train(
+  label ~ .,
+  data = df_final,
+  method = "knn",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  preProcess = c("center", "scale")
+)
+
+library(pROC)
+
+# Extract probabilities for the "severe" class
+roc_data <- final_knn_model$pred
+roc_obj <- roc(response = roc_data$obs,
+               predictor = roc_data$severe,  # Column name for positive class
+               levels = c("moderate", "severe"))  # Set positive class last
+
+# Plot ROC
+plot(roc_obj, col = "blue", lwd = 2, main = "ROC Curve for kNN (Top 5 DE Genes)")
+```
+
+
+## Shiny App
+```{r}
+#| label: fig-shiny-2
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp1.png")
+```
+
+```{r}
+#| label: fig-shiny-3
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp2.png")
+```
+
+```{r}
+#| label: fig-shiny-4
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp3.png")
+```
+
+```{r}
+#| label: fig-shiny-5
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp4.png")
+```
+
+```{r}
+#| label: fig-shiny-6
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp5.png")
+```
+
+```{r}
+#| label: fig-shiny-7
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp6.png")
+```
+
+```{r}
+#| label: fig-shiny-8
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp7.png")
+```
+
+```{r}
+#| label: fig-shiny-9
+#| fig-cap: "Shiny Application Demonstration"
+#| fig-align: center
+#| out-width: 100%
+
+knitr::include_graphics("shinyp8.png")
+```
+
+# Student Contribution
+**Jacinta Ma:** Responsible for writing code to build secondary model and compare 1-step multi-class approach to innovative 2-step binary model. Found 1 of the asthma datasets on GEO. Conducted research on Asthma prevalence and context in Australia. Created the slides for group presentation, wrote model development and selection sections, compiled findings into final report qmd.
+
+**Adam El-Masri:** Responsible for writing code to build primary model & comparing different models to find most suitable model type and the ideal number of genes for highest accuracy on unseen data. Worked on overall batch correction, intra-dataset batch correction, cleaning datasets & figuring out how to combine all datasets for training/testing. Additionally worked on finding 1 dataset to include. Wrote executive summary, conclusion, aims and background parts for report.
+
+**Yinan Shao:** Responsible for writing code for interactive Shiny app and incorporating the models into Shiny using frozen Combat and RDS files. Generated visualisations and flow charts in the Shiny app to make it more visually appealing. Found 1 of the asthma datasets on GEO (GEO143303) and did EDA on that dataset. Additionally, I wrote the Shiny app section for the report.
+
+**Liangyu Gan:** Responsible for initial data analysis and cleanup, creating visualizations for the EDA section, and attempting preliminary modeling. Finding references for research topics. Found a dataset on GEO(GSE40888) and worked on the EDA. Also I prepared the EDA section of the report. 
+
+**Haihui Duan:** Responsible for performing EDA across included GEO datasets, including visualization of class balance and batch effects. Generated multiple asthma-related plots to the Shiny app. Identified and retrieved one relevant asthma dataset from GEO. Wrote the Discussion of shortcomings or issues in approach section for report.
+
+
+# References
+
+Auguie, B. (2017). gridExtra: Miscellaneous Functions for "Grid" Graphics (R package version 2.3). https://CRAN.R-project.org/package=gridExtra
+
+Australian Government Department of Health, Disability and Ageing. (2018). National Asthma Strategy 2018. https://www.health.gov.au/resources/publications/national-asthma-strategy-2018?language=en
+
+Australian Institute of Health and Welfare. (2024). Asthma. https://www.aihw.gov.au/reports/chronic-respiratory-conditions/asthma
+
+Cameron, E., Mo, J., & Yu, C. (2024). A health inequality analysis of childhood asthma prevalence in urban Australia. The Journal of allergy and clinical immunology, 154(2), 285–296. https://doi.org/10.1016/j.jaci.2024.01.023
+
+Chang, W., Cheng, J., Allaire, J. J., Sievert, C., Schloerke, B., Xie, Y., Allen, J., McPherson, J., Dipert, A., & Borges, B. (2024). shiny: Web Application Framework for R (R package version 1.10.0). https://CRAN.R-project.org/package=shiny
+
+Christenson, S. A., Steiling, K., van den Berge, M., Hijazi, K., Hiemstra, P. S., Postma, D. S., Lenburg, M. E., Spira, A., & Woodruff, P. G. (2015). Airway epithelial gene expression in asthma versus healthy controls [Data set]. NCBI Gene 
+Expression Omnibus. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE67472
+
+Christenson, S. A., Steiling, K., van den Berge, M., Hijazi, K., Hiemstra, P. S., Postma, D. S., Lenburg, M. E., Spira, A., & Woodruff, P. G. (2015). Asthma-COPD overlap: Clinical relevance of genomic signatures of type 2 inflammation in chronic obstructive pulmonary disease. American Journal of Respiratory and Critical Care Medicine, 191(7), 758–766.https://pubmed.ncbi.nlm.nih.gov/25611785/
+
+Kasela, S., Ortega, V. E., Martorella, M., Garudadri, S., Nguyen, J., Ampleford, E., Pasanen, A., Nerella, S., Buschur, K. L., Barjaktarevic, I. Z., Barr, R. G., Bleecker, E. R., Bowler, R. P., Comellas, A. P., Cooper, C. B., Couper, D. J., Criner, G. J., Curtis, J. L., Han, M. K., ... Christenson, S. A. (2021). Genetic and non-genetic factors affecting the expression of COVID-19-relevant genes in the large airway epithelium. Genome Medicine, 13(1), 66.https://pubmed.ncbi.nlm.nih.gov/33883027/
+
+Kuhn, M. (2008). Building predictive models in R using the caret package. Journal of Statistical Software, 28(5), 1–26. https://doi.org/10.18637/jss.v028.i05
+Leek, J. T., Johnson, W. E., Parker, H. S., Fertig, E. J., Jaffe, A. E., Zhang, Y., Storey, J. D., & Collado Torres, L. (2024). sva: Surrogate Variable Analysis (R package version 3.54.0). Bioconductor. https://doi.org/10.18129/B9.bioc.sva
+Raedler D, Prazeres da Costa O, Ballenberger N, Klucker E, Böck A, Roeb J, von Mutius E, Buch T, Mansmann U, Schaub B (2014)  Gene expression data from PBMCs human childhood study [Data set]. Gene Expression Omnibus. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE40888
+
+Raedler, D., Ballenberger, N., Klucker, E., Böck, A., Otto, R., Prazeres da Costa, O., Holst, O., Illig, T., Buch, T., von Mutius, E., & Schaub, B. (2015). Identification of novel immune phenotypes for allergic and nonallergic childhood asthma. The Journal of allergy and clinical immunology, 135(1), 81–91. https://doi.org/10.1016/j.jaci.2014.07.046
+
+Singhania A, Woelk CH, Howarth PH (2017)Altered epithelial gene expression in peripheral airways of severe asthma [Data set]. Gene Expression Omnibus. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE64913
+Ritchie, M. E., Phipson, B., Wu, D., Hu, Y., Law, C. W., Shi, W., & Smyth, G. K. (2015). limma powers differential expression analyses for RNA-sequencing and microarray studies. Nucleic Acids Research, 43(7), e47. https://doi.org/10.1093/nar/gkv007
+
+Sánchez-Ovando S, Simpson JL, Baines KJ, Barker D, Wark PA(2021) Transcriptomic profiling of inflammatory phenotypes of severe asthma using endobronchial biopsies [Data set]. Gene Expression Omnibus. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE143303
+
+Singhania, A., Rupani, H., Jayasekera, N., Lumb, S., Hales, P., Gozzard, N., Davies, D. E., Woelk, C. H., & Howarth, P. H. (2017). Altered Epithelial Gene Expression in Peripheral Airways of Severe Asthma. PloS one, 12(1), e0168680. https://doi.org/10.1371/journal.pone.0168680
+
+Wickham, H. (2016). ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York. https://ggplot2.tidyverse.org
+
+Xie, Y. (2015). Dynamic Documents with R and knitr (2nd ed.). Chapman and Hall/CRC.
+
+Xie, Y. (2025). knitr: A General-Purpose Package for Dynamic Report Generation in R (R package version 1.50). https://yihui.org/knitr/
+
+Yang, I. V., Pedersen, B. S., Liu, A., & Schwartz, D. A. (2015). DNA methylation changes and childhood asthma in the inner city [Data set]. NCBI Gene Expression Omnibus. https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE40732
+
+Yang, I. V., Pedersen, B. S., Liu, A., O’Connor, G. T., Teach, S. J., Kattan, M., Misiak, R. T., Gruchalla, R., Steinbach, S. F., Szefler, S. J., Gill, M. A., Calatroni, A., David, G., Hennessy, C. E., Davidson, E. J., Zhang, W., Gergen, P., 
+Togias, A., Busse, W. W., & Schwartz, D. A. (2015). DNA methylation and childhood asthma in the inner city. Journal of Allergy and Clinical Immunology, 136(1), 69–80. https://doi.org/10.1016/j.jaci.2015.01.025
+
+
